@@ -130,6 +130,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/test/cd": self._test_cd,
             "/api/test/media": self._test_media,
             "/api/arm": self._arm,
+            "/api/activity/retry": self._retry,
         }
         if path not in routes:
             self._json(404, {"error": "找不到"})
@@ -252,6 +253,13 @@ class Handler(BaseHTTPRequestHandler):
         db.save_settings(settings)
         db.add_activity("ok", "已開啟自動對齊。之後 Filmix 改名會自動更新 qBittorrent。")
         self._json(200, db.public_settings())
+
+    def _retry(self) -> None:
+        if not self._require():
+            return
+        data = self._read_json()
+        engine.ENGINE.retry(int(data.get("id") or 0))
+        self._json(200, {"ok": True})
 
     def _activity(self) -> None:
         if not self._require():

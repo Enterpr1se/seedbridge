@@ -96,6 +96,26 @@ function row(item) {
   detail.className = "muted";
   detail.textContent = item.torrent ? item.detail : "";
   paths.append(title, oldPath, neu, detail);
+  if (item.retryable && item.status === "error") {
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.className = "btn retry";
+    retry.textContent = "重試";
+    retry.addEventListener("click", async () => {
+      retry.disabled = true;
+      retry.textContent = "已排程";
+      try {
+        await api("/api/activity/retry", { method: "POST", body: { id: item.id } });
+        await loadLog();
+        await refreshHome();
+      } catch (error) {
+        retry.disabled = false;
+        retry.textContent = "重試";
+        detail.textContent = error.message;
+      }
+    });
+    paths.append(retry);
+  }
   node.append(when, badge, paths);
   return node;
 }

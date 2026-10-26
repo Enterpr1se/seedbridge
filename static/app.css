@@ -143,6 +143,7 @@ main { padding: 1.4rem 1.4rem 5rem; max-width: 1080px; }
 }
 .row .paths { min-width: 0; }
 .row .paths div { overflow-wrap: anywhere; font-family: var(--mono); font-size: 0.78rem; }
+.row .btn.retry { margin-top: 0.45rem; min-height: 36px; }
 .row .arrow { color: var(--muted); }
 .filters { display: flex; flex-wrap: wrap; gap: 0.4rem; }
 .filters button { border: 1px solid var(--line); background: transparent; border-radius: 999px; min-height: 40px; padding: 0.2rem 0.8rem; color: var(--muted); }

@@ -66,6 +66,9 @@ def init(data_dir: str) -> None:
         );
         """
     )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(activity)")}
+    if "retry" not in columns:
+        conn.execute("ALTER TABLE activity ADD COLUMN retry TEXT NOT NULL DEFAULT ''")
     row = conn.execute("SELECT json FROM settings WHERE id = 1").fetchone()
     if row is None:
         settings = json.loads(json.dumps(DEFAULT_SETTINGS))
@@ -232,12 +235,19 @@ def public_settings(data: dict | None = None) -> dict:
     return data
 
 
-def add_activity(status: str, detail: str, torrent: str = "", old_path: str = "", new_path: str = "") -> None:
+def add_activity(
+    status: str,
+    detail: str,
+    torrent: str = "",
+    old_path: str = "",
+    new_path: str = "",
+    retry: str = "",
+) -> None:
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     with _lock:
         _db().execute(
-            "INSERT INTO activity (ts, status, torrent, old_path, new_path, detail) VALUES (?, ?, ?, ?, ?, ?)",
-            (ts, status, torrent[:300], old_path[:1000], new_path[:1000], detail[:1000]),
+            "INSERT INTO activity (ts, status, torrent, old_path, new_path, detail, retry) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (ts, status, torrent[:300], old_path[:1000], new_path[:1000], detail[:1000], retry),
         )
         _db().execute("DELETE FROM activity WHERE id NOT IN (SELECT id FROM activity ORDER BY id DESC LIMIT 2000)")
         _db().commit()
@@ -247,10 +257,24 @@ def list_activity(limit: int = 200) -> list[dict]:
     limit = min(500, max(1, limit))
     with _lock:
         rows = _db().execute(
-            "SELECT id, ts, status, torrent, old_path, new_path, detail FROM activity ORDER BY id DESC LIMIT ?",
+            "SELECT id, ts, status, torrent, old_path, new_path, detail, retry FROM activity ORDER BY id DESC LIMIT ?",
             (limit,),
         ).fetchall()
-    return [dict(row) for row in rows]
+    items = []
+    for row in rows:
+        item = dict(row)
+        item["retryable"] = bool(item.pop("retry", ""))
+        items.append(item)
+    return items
+
+
+def get_activity(activity_id: int) -> dict | None:
+    with _lock:
+        row = _db().execute(
+            "SELECT id, ts, status, torrent, old_path, new_path, detail, retry FROM activity WHERE id = ?",
+            (activity_id,),
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def activity_counts() -> dict:
