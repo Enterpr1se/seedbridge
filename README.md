@@ -82,14 +82,23 @@ Repo 要保持 **Public**。私人 repo 的下載網址要登入，Container Sta
 
 ## 之後點更新
 
-唔使再把檔案經電腦傳上 NAS。
+唔使再把檔案經電腦傳上 NAS。兩種方法，設定都留在 `/data`。
 
-1. 用**同一條** latest URL 再下載／再匯入。映像檔會換成新的 `seedbridge:latest`。
-2. 停掉舊容器。`/data` 那個目錄唔好刪。
-3. 用新映像檔建立容器，掛返同一個 `/data` 同 `/media`，IP 用返同一個。
-4. 打開網頁，帳號同設定會在。
+**拉取（較省事）：** Container Station → 映像檔 → 拉取，名稱填：
 
-有新版時，GitHub Releases 會多一個 tag。`latest` 這條 URL 會自動指住最新的 `seedbridge.tar.gz`。
+```
+ghcr.io/enterpr1se/seedbridge:latest
+```
+
+公開映像檔，唔使登入。如果拉唔到，在登錄檔加入 `https://ghcr.io`，帳號留空。之後有新版，再拉取同一個名稱，停掉舊容器，用新映像檔建立，掛返同一個 `/data` 同 `/media`。
+
+**匯入檔：** 用上面同一條 latest URL 再下載，再匯入。映像檔名稱係 `seedbridge:latest`。如果 Container Station 話格式不支援，改匯入這個傳統格式：
+
+```
+https://github.com/Enterpr1se/seedbridge/releases/download/v1.0.0/seedbridge-1.0.0.tar.gz
+```
+
+兩個做法都一樣：停掉舊容器，唔好刪 `/data`，新容器掛返同一個 `/data` 同 `/media`，IP 用返同一個。打開網頁，帳號同設定會在。
 
 ## 原始碼
 
