@@ -338,8 +338,12 @@ def intermediate_rel(old_rel: str, new_rel: str) -> str | None:
 def stage_ops(plans: list[dict]) -> list[dict]:
     """Split a folder+file rename into qBittorrent steps.
 
-    qBittorrent often accepts a same-folder renameFile, then a renameFolder,
-    but drops a single renameFile that changes both at once and still returns 204.
+    When both parent and filename change, issue renameFile old→mid (new name
+    still under the old folder), then renameFile mid→final (parent only).
+    This qBittorrent's renameFolder can return 200, create an empty dest
+    directory, and leave torrent file paths unchanged.
+    Same-filename trees (parent only) still use one renameFolder, with a
+    per-file renameFile fallback in execute_plans.
     """
     usable = [plan for plan in plans if norm_path(plan["old_rel"]) != norm_path(plan["new_rel"])]
     if not usable:
@@ -363,10 +367,12 @@ def stage_ops(plans: list[dict]) -> list[dict]:
     )
     if rooted:
         ops = []
+        rest_changed = False
         for plan, _old_parent, _new_parent in parsed:
             old_rest = plan["old_rel"][len(old_parent) + 1 :]
             new_rest = plan["new_rel"][len(new_parent) + 1 :]
             if old_rest != new_rest:
+                rest_changed = True
                 ops.append(
                     {
                         "kind": "file",
@@ -374,6 +380,17 @@ def stage_ops(plans: list[dict]) -> list[dict]:
                         "new": old_parent + "/" + new_rest,
                     }
                 )
+        if rest_changed:
+            for plan, _old_parent, _new_parent in parsed:
+                new_rest = plan["new_rel"][len(new_parent) + 1 :]
+                ops.append(
+                    {
+                        "kind": "file",
+                        "old": old_parent + "/" + new_rest,
+                        "new": new_parent + "/" + new_rest,
+                    }
+                )
+            return ops
         ops.append({"kind": "folder", "old": old_parent, "new": new_parent})
         return ops
     return [{"kind": "file", "old": plan["old_rel"], "new": plan["new_rel"]} for plan in usable]
@@ -383,12 +400,27 @@ def remaining_ops(plans: list[dict], names: set[str] | list[str]) -> list[dict]:
     have = {norm_path(name) for name in names}
     ops = []
     for op in stage_ops(plans):
-        if op["kind"] == "file" and norm_path(op["new"]) in have:
-            continue
+        if op["kind"] == "file":
+            if norm_path(op["new"]) in have:
+                continue
+            if _file_op_past(op, plans, have):
+                continue
         if op["kind"] == "folder" and all(norm_path(plan["new_rel"]) in have for plan in plans):
             continue
         ops.append(op)
     return ops
+
+
+def _file_op_past(op: dict, plans: list[dict], have: set[str]) -> bool:
+    """True when qBit already has a later name for the plan this file op belongs to."""
+    target = norm_path(op["new"])
+    for plan in plans:
+        if norm_path(plan["new_rel"]) not in have:
+            continue
+        mid = intermediate_rel(plan["old_rel"], plan["new_rel"])
+        if mid and target == norm_path(mid):
+            return True
+    return False
 
 
 class RenameFailed(RuntimeError):
@@ -445,15 +477,15 @@ def _qbit_rel(plan: dict, names: set[str]) -> str:
 
 def align_disk_to_qbit(plans: list[dict], names: set[str], host_save: str) -> None:
     for plan in plans:
-        if norm_path(plan["new_rel"]) in names and os.path.lexists(plan["host_new"]):
+        # Filmix/CloudDrive may already hold the final bytes. Leave them there;
+        # waiting after renameFile accepts host_new in place of a missing mid.
+        if os.path.lexists(plan["host_new"]):
             continue
         expected = _disk_for(host_save, _qbit_rel(plan, names))
         if os.path.lexists(expected):
             continue
         source = ""
-        if os.path.lexists(plan["host_new"]):
-            source = plan["host_new"]
-        elif os.path.lexists(plan["host_old"]):
+        if os.path.lexists(plan["host_old"]):
             source = plan["host_old"]
         if not source:
             raise RenameFailed(f"舊路徑同新路徑都找不到檔案：{plan['old_rel']}")
@@ -465,12 +497,28 @@ def align_disk_to_qbit(plans: list[dict], names: set[str], host_save: str) -> No
         os.rename(source, expected)
 
 
-def _wait_ready(fetch, expect_rels: list[str], expect_disks: list[str], timeout: float, pause: float, sleep, now) -> bool:
+def _file_disk_alts(op: dict, plans: list[dict], host_save: str) -> list[str]:
+    """Stage target, or the matching plan's Filmix final path for a mid/final rename."""
+    alts = [_disk_for(host_save, op["new"])]
+    op_new = norm_path(op["new"])
+    for plan in plans:
+        mid = intermediate_rel(plan["old_rel"], plan["new_rel"])
+        if op_new != norm_path(plan["new_rel"]) and (not mid or op_new != norm_path(mid)):
+            continue
+        host_new = plan.get("host_new") or ""
+        if host_new and host_new not in alts:
+            alts.append(host_new)
+    return alts
+
+
+def _wait_ready(fetch, expect_rels: list[str], disk_groups: list[list[str]], timeout: float, pause: float, sleep, now) -> bool:
     deadline = now() + timeout
     while True:
         names = _names_of(fetch())
         rels_ok = all(norm_path(rel) in names for rel in expect_rels)
-        disks_ok = all(os.path.lexists(path) for path in expect_disks)
+        disks_ok = all(
+            any(os.path.lexists(path) for path in group if path) for group in disk_groups
+        )
         if rels_ok and disks_ok:
             return True
         if now() >= deadline:
@@ -533,14 +581,25 @@ def execute_plans(
             if op["kind"] == "folder":
                 client.rename_folder(infohash, op["old"], op["new"])
                 expect_rels = [plan["new_rel"] for plan in plans]
-                expect_disks = [plan["host_new"] for plan in plans]
+                disk_groups = [[plan["host_new"]] for plan in plans]
                 label = "資料夾"
-            else:
-                client.rename_file(infohash, op["old"], op["new"])
-                expect_rels = [op["new"]]
-                expect_disks = [_disk_for(host_save, op["new"])]
-                label = "檔名"
-            if not _wait_ready(fetch, expect_rels, expect_disks, timeout, pause, sleep, now):
+                if _wait_ready(fetch, expect_rels, disk_groups, timeout, pause, sleep, now):
+                    continue
+                say(f"renameFolder 未完成，改為逐檔 renameFile：{op['old']} → {op['new']}")
+                names_now = _names_of(fetch())
+                for plan in plans:
+                    current = _qbit_rel(plan, names_now)
+                    if norm_path(current) == norm_path(plan["new_rel"]):
+                        continue
+                    client.rename_file(infohash, current, plan["new_rel"])
+                if not _wait_ready(fetch, expect_rels, disk_groups, timeout, pause, sleep, now):
+                    raise RenameFailed(f"qBittorrent 未完成改名（{label}）：{op['new']}")
+                continue
+            client.rename_file(infohash, op["old"], op["new"])
+            expect_rels = [op["new"]]
+            disk_groups = [_file_disk_alts(op, plans, host_save)]
+            label = "檔名"
+            if not _wait_ready(fetch, expect_rels, disk_groups, timeout, pause, sleep, now):
                 raise RenameFailed(f"qBittorrent 未完成改名（{label}）：{op['new']}")
     except Exception as exc:
         try:
@@ -939,10 +998,15 @@ def self_test() -> None:
         }
     ]
     ops = stage_ops(movie)
-    assert [item["kind"] for item in ops] == ["file", "folder"], ops
+    assert [item["kind"] for item in ops] == ["file", "file"], ops
     assert ops[0]["old"] == "Old Title/Old.iso" and ops[0]["new"] == "Old Title/New.iso"
-    assert ops[1] == {"kind": "folder", "old": "Old Title", "new": "New Title (2026) [tmdbid=1]"}
+    assert ops[1] == {
+        "kind": "file",
+        "old": "Old Title/New.iso",
+        "new": "New Title (2026) [tmdbid=1]/New.iso",
+    }
     assert remaining_ops(movie, {"Old Title/New.iso"}) == [ops[1]]
+    assert remaining_ops(movie, {"New Title (2026) [tmdbid=1]/New.iso"}) == []
     print("self-test ok")
 
 
