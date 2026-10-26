@@ -119,6 +119,19 @@ def qbit_to_local(path: str, maps: list[dict]) -> str:
     return mapped if mapped is not None else norm_path(path)
 
 
+def _login_result(code: int, body: bytes) -> None:
+    text = body.decode("utf-8", "replace").strip()
+    if text == "Fails.":
+        raise RuntimeError("登入失敗，帳號或密碼不正確")
+    if code == 403:
+        raise RuntimeError("登入被拒絕（HTTP 403）。qBittorrent 可能暫時封鎖呢個 IP")
+    # 5.1 及以前：HTTP 200，內容 Ok.
+    # 5.2 起：成功改為 HTTP 204，內容係空的。VueTorrent 都係用呢套 API。
+    if code in (200, 204) and text in ("", "Ok."):
+        return
+    raise RuntimeError(f"登入失敗（HTTP {code}）")
+
+
 class Qbit:
     def __init__(self, settings: dict, timeout: int = 8):
         qb = settings["qb"]
@@ -152,9 +165,7 @@ class Qbit:
             "/api/v2/auth/login",
             {"username": self.user, "password": self.password},
         )
-        text = body.decode("utf-8", "replace")
-        if code != 200 or "Ok" not in text:
-            raise RuntimeError(f"登入失敗（HTTP {code}）")
+        _login_result(code, body)
 
     def call(self, method: str, path: str, form: dict | None = None, query: dict | None = None):
         code, body = self._req(method, path, form, query)
