@@ -1,0 +1,42 @@
+name: Release image
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          docker build -t seedbridge:latest .
+          docker save seedbridge:latest | gzip -1 > seedbridge.tar.gz
+
+      - name: Upload Container Station image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" seedbridge.tar.gz --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" seedbridge.tar.gz \
+              --title "${GITHUB_REF_NAME}" \
+              --notes "Container Station 匯入 seedbridge.tar.gz。網址見 README。"
+          fi
+
+      - name: Push to GHCR
+        run: |
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          image="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          docker tag seedbridge:latest "$image:latest"
+          docker tag seedbridge:latest "$image:${GITHUB_REF_NAME#v}"
+          docker push "$image:latest"
+          docker push "$image:${GITHUB_REF_NAME#v}"

@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Seedbridge</title>
+  <link rel="icon" href="/favicon.svg" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Noto+Sans+TC:wght@400;500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+  <div id="gate" class="gate">
+    <form id="gate-form" class="card gate-card">
+      <p class="brand">Seedbridge</p>
+      <h1 id="gate-title">登入</h1>
+      <p id="gate-lead" class="lead">Filmix 改名之後，自動幫 qBittorrent 對齊資料夾同檔名。</p>
+      <label class="field">
+        <span>帳號</span>
+        <input id="username" name="username" autocomplete="username" required />
+      </label>
+      <label class="field">
+        <span>密碼</span>
+        <input id="password" name="password" type="password" autocomplete="current-password" required />
+      </label>
+      <label class="field" id="confirm-wrap">
+        <span>再輸入密碼</span>
+        <input id="confirm" name="confirm" type="password" autocomplete="new-password" />
+      </label>
+      <p id="gate-error" class="form-error" role="alert"></p>
+      <button id="gate-submit" class="btn primary" type="submit">進入</button>
+    </form>
+  </div>
+
+  <div id="shell" class="shell hidden">
+    <aside class="side">
+      <div class="side-brand">
+        <span class="mark" aria-hidden="true"></span>
+        <div>
+          <strong>Seedbridge</strong>
+          <small>自動對齊做種</small>
+        </div>
+      </div>
+      <nav class="nav">
+        <button type="button" data-view="home" class="active">總覽</button>
+        <button type="button" data-view="log">改名紀錄</button>
+        <button type="button" data-view="settings">設定</button>
+      </nav>
+      <button id="logout" class="btn ghost" type="button">登出</button>
+    </aside>
+
+    <main>
+      <section id="view-home">
+        <header class="page-head">
+          <div>
+            <h1>總覽</h1>
+            <p class="lead">Filmix 經 CloudDrive 改名後，程式會自己暫停該種子、更新 qBittorrent 的資料夾同檔名，然後恢復做種。你唔使手動暫停。</p>
+          </div>
+          <button id="arm" class="btn primary" type="button">開始自動改名</button>
+        </header>
+        <div id="banner" class="banner hidden"></div>
+        <div class="stats">
+          <article>
+            <span>今日已對齊</span>
+            <strong id="count-ok">0</strong>
+          </article>
+          <article>
+            <span>今日略過 / 失敗</span>
+            <strong id="count-bad">0</strong>
+          </article>
+          <article>
+            <span>等候處理</span>
+            <strong id="count-pending">0</strong>
+          </article>
+        </div>
+        <div class="grid-2">
+          <article class="card">
+            <h2>連線</h2>
+            <ul class="checks" id="checks"></ul>
+            <p id="last-report" class="mono muted"></p>
+          </article>
+          <article class="card">
+            <h2>CloudDrive Webhook</h2>
+            <p class="lead">在 CloudDrive 的 webhook 填下面這條。改名通知會直接打到這個容器。</p>
+            <div class="copy-row">
+              <code id="hook-url">登入後顯示</code>
+              <button id="copy-hook" class="btn" type="button">複製</button>
+            </div>
+          </article>
+        </div>
+        <article class="card">
+          <h2>最近改動</h2>
+          <div id="recent" class="rows"></div>
+        </article>
+      </section>
+
+      <section id="view-log" class="hidden">
+        <header class="page-head">
+          <div>
+            <h1>改名紀錄</h1>
+            <p class="lead">每一行係一次自動對齊：舊路徑、Filmix 的 Emby / TMDB 新路徑、結果。</p>
+          </div>
+        </header>
+        <div class="filters" id="filters">
+          <button type="button" data-filter="work" class="active">改動</button>
+          <button type="button" data-filter="ok">成功</button>
+          <button type="button" data-filter="error">失敗</button>
+          <button type="button" data-filter="all">全部（含 webhook）</button>
+        </div>
+        <label class="field search">
+          <span>搜尋路徑或種子</span>
+          <input id="search" type="search" placeholder="例如 Movie Name" />
+        </label>
+        <div id="log-list" class="rows"></div>
+      </section>
+
+      <section id="view-settings" class="hidden">
+        <header class="page-head">
+          <div>
+            <h1>設定</h1>
+            <p class="lead">填 qBittorrent 同 CloudDrive 的 IP、埠，以及三條路徑。儲存後可以開自動對齊。</p>
+          </div>
+          <button id="save" class="btn primary" type="button">儲存設定</button>
+        </header>
+        <p id="save-msg" class="form-error" role="status"></p>
+        <div class="grid-2">
+          <form id="form-qb" class="card">
+            <h2>qBittorrent</h2>
+            <div class="split">
+              <label class="field"><span>IP</span><input name="host" required placeholder="192.168.8.197" /></label>
+              <label class="field port"><span>埠</span><input name="port" inputmode="numeric" required /></label>
+            </div>
+            <label class="check"><input name="https" type="checkbox" /> HTTPS</label>
+            <label class="field"><span>WebUI 帳號</span><input name="username" autocomplete="off" /></label>
+            <label class="field"><span>WebUI 密碼</span><input name="password" type="password" autocomplete="new-password" placeholder="留空代表不改已儲存的密碼" /></label>
+            <button class="btn" type="button" id="test-qb">測試連線</button>
+            <p class="test-out" id="out-qb"></p>
+          </form>
+          <form id="form-cd" class="card">
+            <h2>CloudDrive</h2>
+            <p class="lead">只用來確認容器睇到 CloudDrive。Webhook 是 CloudDrive 主動通知 Seedbridge，不是連去這個埠改名。</p>
+            <div class="split">
+              <label class="field"><span>IP</span><input name="host" placeholder="192.168.8.197" /></label>
+              <label class="field port"><span>埠</span><input name="port" inputmode="numeric" /></label>
+            </div>
+            <label class="check"><input name="https" type="checkbox" /> HTTPS</label>
+            <button class="btn" type="button" id="test-cd">測試連線</button>
+            <p class="test-out" id="out-cd"></p>
+          </form>
+        </div>
+
+        <form id="form-auto" class="card">
+          <h2>路徑對應</h2>
+          <p class="lead">Filmix 建立的 TMDB / Emby 資料夾必須仍在 qBittorrent 同一個儲存目錄裡面。三欄都要填。</p>
+          <div id="maps"></div>
+          <button id="add-map" class="btn" type="button">加一組路徑</button>
+          <button id="test-media" class="btn" type="button">檢查容器內目錄</button>
+          <p class="test-out" id="out-media"></p>
+          <div class="split top">
+            <label class="field"><span>等齊改名（秒）</span><input name="debounce_sec" inputmode="numeric" /></label>
+            <label class="check lone"><input name="enabled" type="checkbox" /> 接收 webhook 並處理</label>
+          <label class="check lone"><input name="dry_run" type="checkbox" /> 只記錄，不改 qBittorrent</label>
+          </div>
+          <label class="field">
+            <span>Webhook token</span>
+            <input name="webhook_token" class="mono" autocomplete="off" />
+          </label>
+          <p class="hint" id="raw-hint"></p>
+        </form>
+      </section>
+    </main>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>

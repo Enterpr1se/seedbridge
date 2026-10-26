@@ -1,0 +1,121 @@
+# Seedbridge
+
+Filmix 經 CloudDrive 改成 TMDB / Emby 資料夾同檔名之後，自動通知 qBittorrent 更新路徑，種子繼續做種。程式會自己暫停該種子幾秒再恢復，你唔使手動暫停，亦唔使人手改 qBittorrent 的檔名。
+
+映像檔係 linux/amd64，對應 TS-464。
+
+## Container Station 用 URL 匯入
+
+永遠指向最新版（之後更新都係同一條）：
+
+```
+https://github.com/Enterpr1se/seedbridge/releases/latest/download/seedbridge.tar.gz
+```
+
+目前這個版本：
+
+```
+https://github.com/Enterpr1se/seedbridge/releases/download/v1.0.0/seedbridge.tar.gz
+```
+
+1. Container Station → **映像檔** → **匯入**。
+2. 如果匯入視窗可以貼 URL，貼上面第一條。
+3. 如果只可以選檔案，在 NAS 用 File Station 的下載，或者 SSH 先存到共享資料夾：
+
+```bash
+wget -O /share/Public/seedbridge.tar.gz \
+  https://github.com/Enterpr1se/seedbridge/releases/latest/download/seedbridge.tar.gz
+```
+
+然後匯入時選 **本機 QNAP 裝置**，揀 `seedbridge.tar.gz`。匯入後映像檔名稱係 `seedbridge:latest`。
+
+Repo 要保持 **Public**。私人 repo 的下載網址要登入，Container Station 拎唔到。
+
+## 建立容器
+
+用匯入咗的映像檔建立容器：
+
+| 項目 | 值 |
+|---|---|
+| 名稱 | `seedbridge` |
+| 重新啟動 | 除非手動停止 |
+| 網路 | 一個未用的獨立 IP（macvlan）。如果用橋接，對外埠填 `8080` |
+| 目錄 `/data` | 一個空目錄，例如 `/share/Container/seedbridge/data`。登入、設定、改名紀錄都在這裡，更新時一定要掛返同一個 |
+| 目錄 `/media` | TS-464 的影片共享資料夾，必須同 qBittorrent 係同一個資料夾 |
+
+瀏覽器開 `http://容器IP:8080`，第一次會叫你建立管理員帳號。
+
+## 設定
+
+設定頁：
+
+- **qBittorrent**：`192.168.8.197`、WebUI 埠、帳號密碼，然後「測試連線」。
+- **CloudDrive**：容器 IP 同埠（預設 19798）。只係用來測試呢部容器睇唔睇到 CloudDrive。改名通知係 CloudDrive 打過來，不是 Seedbridge 連去 CloudDrive 改檔。
+- **路徑對應**三欄，指同一樣位置的三種寫法：
+
+| CloudDrive webhook 入面的路徑 | Seedbridge 容器內 | qBittorrent 容器內 |
+|---|---|---|
+| webhook 的 `source_file` 前綴 | 掛住影片的路徑，預設 `/media` | qBittorrent 儲存路徑，常見 `/downloads` |
+
+例子：Filmix 把 `/115/Video/Movie/Old.mkv` 改成 `/115/Video/Movie/New.mkv`，而這個目錄在 NAS 上係 `/share/Video`，qBittorrent 入面係 `/downloads`：
+
+| CloudDrive | 容器內 | qBittorrent |
+|---|---|---|
+| `/115/Video` | `/media` | `/downloads` |
+
+三欄的剩餘部分必須一樣。先按「檢查容器內目錄」，確認 `/media` 睇到影片。
+
+建議第一次：
+
+1. 勾「接收 webhook 並處理」。
+2. 勾「只記錄，不改 qBittorrent」。
+3. 等 Filmix 改一次名，去「改名紀錄」睇舊路徑同新路徑對唔對。
+4. 取消「只記錄」，按總覽的「開始自動改名」。
+
+你自己暫停住的種子唔會被打開。
+
+## CloudDrive webhook
+
+總覽頁有一條完整 URL（已經帶 token）。CloudDrive 的 `webhook.toml` 用總覽頁那條，或者照 `webhook.toml.example`，把 IP 同 token 換成你的。
+
+只需要 `rename`。Emby 直接讀同一個資料夾的話，唔使再轉去 Symedia。
+
+## 之後點更新
+
+唔使再把檔案經電腦傳上 NAS。
+
+1. 用**同一條** latest URL 再下載／再匯入。映像檔會換成新的 `seedbridge:latest`。
+2. 停掉舊容器。`/data` 那個目錄唔好刪。
+3. 用新映像檔建立容器，掛返同一個 `/data` 同 `/media`，IP 用返同一個。
+4. 打開網頁，帳號同設定會在。
+
+有新版時，GitHub Releases 會多一個 tag。`latest` 這條 URL 會自動指住最新的 `seedbridge.tar.gz`。
+
+## 原始碼
+
+```
+app.py          WebUI、登入、webhook
+engine.py       對齊 qBittorrent 的改名
+db.py           設定同紀錄（SQLite，放在 /data）
+static/         介面
+Dockerfile      自己 build 用
+```
+
+容器入面沒有密碼。qBittorrent 密碼只寫入 `/data/seedbridge.db`。
+
+自己 build：
+
+```bash
+docker build -t seedbridge:latest .
+```
+
+## 程式實際做咩
+
+CloudDrive 送來 rename 之後，程式會等幾秒（預設 8 秒，等 Filmix 一次改完資料夾同檔案），然後：
+
+1. 用舊路徑搵到對應的種子。
+2. 暫停該種子（你原本已經暫停的就保持暫停）。
+3. 用 qBittorrent API 更新資料夾名同檔名，令做種路徑等於磁碟上的新名字。
+4. 恢復做種。
+
+對唔到、路徑衝突、或者 API 失敗，會寫入改名紀錄，唔會刪檔。

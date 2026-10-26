@@ -1,0 +1,30 @@
+# CloudDrive2 config 目錄，檔名 webhook.toml。
+# base_url 用 Seedbridge 總覽頁顯示的網址（含 token），不要連去 CloudDrive 自己。
+
+[global_params]
+base_url = "http://192.168.8.210:8080"
+enabled = true
+
+[global_params.default_headers]
+content-type = "application/json"
+user-agent = "clouddrive2/{version}"
+
+[file_system_watcher]
+url = "{base_url}/file_notify?token=貼上設定頁的token"
+method = "POST"
+enabled = true
+body = '''
+{
+  "device_name": "{device_name}",
+  "event_category": "{event_category}",
+  "event_name": "{event_name}",
+  "data": [
+      {
+        "action": "{action}",
+        "is_dir": "{is_dir}",
+        "source_file": "{source_file}",
+        "destination_file": "{destination_file}"
+      }
+  ]
+}
+'''

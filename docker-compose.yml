@@ -1,0 +1,26 @@
+# QNAP Container Station：用「建立應用程式」匯入這個檔。
+# 獨立 IP 請先在 NAS 建立 macvlan（介面名 eth0 / bond0 按你的網路改），
+# 然後取消下面 networks 的註解，並刪除 ports（macvlan 唔好再做埠對應）。
+services:
+  seedbridge:
+    build: .
+    image: seedbridge:1.0.0
+    container_name: seedbridge
+    restart: unless-stopped
+    environment:
+      DATA_DIR: /data
+      PORT: "8080"
+    volumes:
+      - /share/Container/seedbridge/data:/data
+      # 左邊改成 TS-464 真正的影片目錄，要同 qBittorrent 係同一個資料夾。
+      - /share/Video:/media
+    ports:
+      - "8080:8080"
+    # networks:
+    #   qnap_lan:
+    #     ipv4_address: 192.168.8.210
+
+# networks:
+#   qnap_lan:
+#     external: true
+#     name: qnap_macvlan
