@@ -540,6 +540,60 @@ def test_apply_renames_torrent_title_when_enabled():
         assert open(host_new, encoding="utf-8").read() == "iso"
 
 
+def test_skips_missing_sibling_under_folder_rename():
+    """A never-downloaded file must not fail the folder rename of files that exist."""
+    with tempfile.TemporaryDirectory() as tmp:
+        present_old = "新特警判官.2012/新特警判官.mkv"
+        present_new = "新特警判官 (2012) [tmdbid=1]/新特警判官.mkv"
+        missing_old = "新特警判官.2012/新特警判官.jpg"
+        missing_new = "新特警判官 (2012) [tmdbid=1]/新特警判官.jpg"
+        host_new = os.path.join(tmp, present_new)
+        os.makedirs(os.path.dirname(host_new), exist_ok=True)
+        with open(host_new, "w", encoding="utf-8") as handle:
+            handle.write("mkv")
+        plans = [
+            {
+                "old_rel": present_old,
+                "new_rel": present_new,
+                "host_old": engine.norm_path(os.path.join(tmp, present_old)),
+                "host_new": engine.norm_path(host_new),
+            },
+            {
+                "old_rel": missing_old,
+                "new_rel": missing_new,
+                "host_old": engine.norm_path(os.path.join(tmp, missing_old)),
+                "host_new": engine.norm_path(os.path.join(tmp, missing_new)),
+            },
+        ]
+        client = DiskSyncQbit([present_old, missing_old], tmp)
+        _run(client, plans, tmp)
+        assert ("folder", "新特警判官.2012", "新特警判官 (2012) [tmdbid=1]") in client.calls
+        assert present_new in client.names
+        assert os.path.isfile(host_new)
+        assert open(host_new, encoding="utf-8").read() == "mkv"
+        assert not os.path.exists(os.path.join(tmp, missing_old))
+        assert not os.path.exists(os.path.join(tmp, missing_new))
+
+
+def test_only_missing_files_do_not_raise():
+    with tempfile.TemporaryDirectory() as tmp:
+        old_rel = "Old/skip.jpg"
+        new_rel = "New/skip.jpg"
+        plans = [
+            {
+                "old_rel": old_rel,
+                "new_rel": new_rel,
+                "host_old": engine.norm_path(os.path.join(tmp, old_rel)),
+                "host_new": engine.norm_path(os.path.join(tmp, new_rel)),
+            }
+        ]
+        engine.align_disk_to_qbit(plans, {old_rel}, tmp)
+        client = DiskSyncQbit([old_rel], tmp)
+        _run(client, plans, tmp)
+        assert client.calls == []
+        assert not os.path.exists(os.path.join(tmp, new_rel))
+
+
 if __name__ == "__main__":
     test_stages()
     test_delayed_content_then_success()
@@ -553,5 +607,7 @@ if __name__ == "__main__":
     test_ensure_disk_stays_inside_save()
     test_apply_leaves_torrent_title()
     test_apply_renames_torrent_title_when_enabled()
+    test_skips_missing_sibling_under_folder_rename()
+    test_only_missing_files_do_not_raise()
     engine.self_test()
     print("test_rename ok")

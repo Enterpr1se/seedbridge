@@ -475,6 +475,15 @@ def _qbit_rel(plan: dict, names: set[str]) -> str:
     return plan["old_rel"]
 
 
+def plan_has_bytes(plan: dict, host_save: str) -> bool:
+    """True when this torrent file has bytes at the old, mid, or Filmix path."""
+    paths = [plan.get("host_old") or "", plan.get("host_new") or ""]
+    mid = intermediate_rel(plan.get("old_rel") or "", plan.get("new_rel") or "")
+    if mid:
+        paths.append(_disk_for(host_save, mid))
+    return any(path and os.path.lexists(path) for path in paths)
+
+
 def align_disk_to_qbit(plans: list[dict], names: set[str], host_save: str) -> None:
     for plan in plans:
         # Filmix/CloudDrive may already hold the final bytes. Leave them there;
@@ -488,7 +497,7 @@ def align_disk_to_qbit(plans: list[dict], names: set[str], host_save: str) -> No
         if os.path.lexists(plan["host_old"]):
             source = plan["host_old"]
         if not source:
-            raise RenameFailed(f"舊路徑同新路徑都找不到檔案：{plan['old_rel']}")
+            continue
         if source == expected:
             continue
         if os.path.lexists(expected):
@@ -705,6 +714,18 @@ def execute_plans(
     def _start() -> None:
         if resume:
             _client_quiet(client, "start", infohash)
+
+    kept: list[dict] = []
+    for plan in plans:
+        if plan_has_bytes(plan, host_save):
+            kept.append(plan)
+        else:
+            say(f"未下載或缺檔，已跳過 {plan.get('old_rel') or ''}")
+    plans = kept
+    if not plans:
+        say("沒有已下載的檔需要改名")
+        _start()
+        return
 
     names = _names_of(fetch())
     if plans and all(norm_path(plan["new_rel"]) in names and os.path.lexists(plan["host_new"]) for plan in plans):
@@ -957,14 +978,18 @@ class Engine:
                     ambiguous.add(host_file)
                     continue
                 claimed[host_file] = infohash
-                plans.append(
-                    {
-                        "old_rel": rel,
-                        "new_rel": new_host[len(norm_path(host_save)) + 1 :],
-                        "host_old": host_file,
-                        "host_new": new_host,
-                    }
-                )
+                new_rel = new_host[len(norm_path(host_save)) + 1 :]
+                draft = {
+                    "old_rel": rel,
+                    "new_rel": new_rel,
+                    "host_old": host_file,
+                    "host_new": new_host,
+                }
+                if not plan_has_bytes(draft, host_save):
+                    db.add_activity("skip", "未下載或缺檔，已跳過", tor.get("name") or "", rel, new_rel)
+                    self.log(f"未下載或缺檔，已跳過 {rel}")
+                    continue
+                plans.append(draft)
             if plans:
                 plans_by_hash[infohash] = {"torrent": tor, "host_save": host_save, "plans": plans, "files": files}
 
