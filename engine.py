@@ -511,6 +511,135 @@ def _file_disk_alts(op: dict, plans: list[dict], host_save: str) -> list[str]:
     return alts
 
 
+def _strictly_under(parent: str, child: str) -> bool:
+    """True when child is inside parent. The save path itself is not inside."""
+    parent, child = norm_path(parent), norm_path(child)
+    if not parent or not child:
+        return False
+    return child.startswith(parent + "/")
+
+
+def _unique_paths(paths: list[str]) -> list[str]:
+    unique: list[str] = []
+    for path in paths:
+        if not path:
+            continue
+        path = norm_path(path)
+        if path not in unique:
+            unique.append(path)
+    return unique
+
+
+def _matching_plans(op: dict, plans: list[dict]) -> list[dict]:
+    source = norm_path(op["old"])
+    target = norm_path(op["new"])
+    matched = []
+    for plan in plans:
+        rels = {norm_path(plan["old_rel"]), norm_path(plan["new_rel"])}
+        mid = intermediate_rel(plan["old_rel"], plan["new_rel"])
+        if mid:
+            rels.add(norm_path(mid))
+        if source in rels or target in rels:
+            matched.append(plan)
+    return matched
+
+
+def _final_covers_mid(op: dict, plans: list[dict]) -> bool:
+    """Filmix already left this file at host_new, so a mid stage must not pull it back."""
+    if op.get("kind") != "file":
+        return False
+    target = norm_path(op["new"])
+    for plan in plans:
+        mid = intermediate_rel(plan["old_rel"], plan["new_rel"])
+        if not mid or norm_path(mid) != target:
+            continue
+        host_new = plan.get("host_new") or ""
+        if host_new and os.path.lexists(host_new):
+            return True
+    return False
+
+
+def _file_sources(op: dict, plans: list[dict], host_save: str) -> list[str]:
+    """Candidate bytes for a file stage: old path, mid, host_old, then host_new if this is the final name."""
+    target = norm_path(op["new"])
+    primary = [_disk_for(host_save, op["old"])]
+    mids: list[str] = []
+    olds: list[str] = []
+    finals: list[str] = []
+    for plan in _matching_plans(op, plans):
+        mid = intermediate_rel(plan["old_rel"], plan["new_rel"])
+        if mid:
+            mids.append(_disk_for(host_save, mid))
+        olds.append(_disk_for(host_save, plan["old_rel"]))
+        if plan.get("host_old"):
+            olds.append(plan["host_old"])
+        host_new = plan.get("host_new") or ""
+        if host_new and target == norm_path(plan["new_rel"]) and (not mid or target != norm_path(mid)):
+            finals.append(host_new)
+    return _unique_paths(primary + mids + olds + finals)
+
+
+def _plan_file_sources(plan: dict, host_save: str, current_rel: str) -> list[str]:
+    sources = []
+    if current_rel:
+        sources.append(_disk_for(host_save, current_rel))
+    sources.append(_disk_for(host_save, plan["old_rel"]))
+    mid = intermediate_rel(plan["old_rel"], plan["new_rel"])
+    if mid:
+        sources.append(_disk_for(host_save, mid))
+    if plan.get("host_old"):
+        sources.append(plan["host_old"])
+    if plan.get("host_new"):
+        sources.append(plan["host_new"])
+    return _unique_paths(sources)
+
+
+def _ensure_disk_at(host_save: str, src_candidates: list[str], dest_rel: str) -> bool:
+    """Put bytes at dest_rel inside host_save. Return True when a rename happened.
+
+    qBittorrent 5.3 rename APIs are no-ops unless this path already exists.
+    Sources outside host_save are ignored. host_save itself is never renamed.
+    """
+    host = norm_path(host_save)
+    dest = _disk_for(host, dest_rel)
+    if not _strictly_under(host, dest):
+        raise RenameFailed(f"目標路徑離開儲存目錄：{dest_rel}")
+    if os.path.lexists(dest):
+        return False
+    for src in src_candidates:
+        if not src:
+            continue
+        src = norm_path(src)
+        if src == dest or not _strictly_under(host, src):
+            continue
+        if not os.path.lexists(src):
+            continue
+        parent = os.path.dirname(dest)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        os.rename(src, dest)
+        return True
+    return False
+
+
+def _ensure_op_disk(op: dict, plans: list[dict], host_save: str) -> bool:
+    if op["kind"] == "folder":
+        return _ensure_disk_at(host_save, [_disk_for(host_save, op["old"])], op["new"])
+    if _final_covers_mid(op, plans):
+        return False
+    return _ensure_disk_at(host_save, _file_sources(op, plans, host_save), op["new"])
+
+
+def _client_quiet(client, name: str, infohash: str) -> None:
+    method = getattr(client, name, None)
+    if method is None:
+        return
+    try:
+        method(infohash)
+    except Exception:  # noqa: BLE001
+        return
+
+
 def _wait_ready(fetch, expect_rels: list[str], disk_groups: list[list[str]], timeout: float, pause: float, sleep, now) -> bool:
     deadline = now() + timeout
     while True:
@@ -557,8 +686,14 @@ def execute_plans(
     sleep=time.sleep,
     now=time.time,
     log=None,
+    resume: bool = True,
 ) -> None:
-    """Rename inside qBittorrent one stage at a time. On failure, disk returns to the Filmix names."""
+    """Stop, move bytes onto each stage target, then rename in qBittorrent.
+
+    qBittorrent 5.3 can answer HTTP 200 from renameFile/renameFolder and leave
+    torrent paths unchanged unless the new path is already on disk. On failure,
+    bytes return to the Filmix names. resume=False leaves a user-paused torrent stopped.
+    """
 
     def say(message: str) -> None:
         if log:
@@ -567,17 +702,26 @@ def execute_plans(
     def fetch() -> list[dict]:
         return client.files(infohash) or []
 
+    def _start() -> None:
+        if resume:
+            _client_quiet(client, "start", infohash)
+
     names = _names_of(fetch())
     if plans and all(norm_path(plan["new_rel"]) in names and os.path.lexists(plan["host_new"]) for plan in plans):
         say("qBittorrent 已是新路徑")
+        _start()
         return
     try:
+        _client_quiet(client, "stop", infohash)
         align_disk_to_qbit(plans, names, host_save)
         ops = remaining_ops(plans, _names_of(fetch()))
         if not ops:
+            _start()
             return
         for index, op in enumerate(ops, start=1):
             say(f"階段 {index}/{len(ops)} {op['kind']} {op['old']} → {op['new']}")
+            if _ensure_op_disk(op, plans, host_save):
+                say(f"磁碟已搬到 {op['new']}")
             if op["kind"] == "folder":
                 client.rename_folder(infohash, op["old"], op["new"])
                 expect_rels = [plan["new_rel"] for plan in plans]
@@ -591,6 +735,8 @@ def execute_plans(
                     current = _qbit_rel(plan, names_now)
                     if norm_path(current) == norm_path(plan["new_rel"]):
                         continue
+                    if _ensure_disk_at(host_save, _plan_file_sources(plan, host_save, current), plan["new_rel"]):
+                        say(f"磁碟已搬到 {plan['new_rel']}")
                     client.rename_file(infohash, current, plan["new_rel"])
                 if not _wait_ready(fetch, expect_rels, disk_groups, timeout, pause, sleep, now):
                     raise RenameFailed(f"qBittorrent 未完成改名（{label}）：{op['new']}")
@@ -610,14 +756,17 @@ def execute_plans(
             finals = False
         if finals:
             say("qBittorrent 已跟上最終路徑")
+            _start()
             return
         try:
             restore_filmix(plans, host_save)
         except OSError as restore_exc:
             say(f"撥回 Filmix 路徑失敗：{restore_exc}")
+        _start()
         if isinstance(exc, RenameFailed):
             raise
         raise RenameFailed(str(exc)) from exc
+    _start()
 
 
 class Engine:
@@ -881,7 +1030,7 @@ class Engine:
         except Exception as exc:  # noqa: BLE001
             self.log(f"pause skipped: {exc}")
         try:
-            execute_plans(client, infohash, plans, host_save, log=self.log)
+            execute_plans(client, infohash, plans, host_save, log=self.log, resume=resume)
             for plan in plans:
                 db.add_activity("ok", "已自動更新路徑，並恢復做種", name, plan["old_rel"], plan["new_rel"])
             all_rels = [str(item.get("name") or "") for item in files]
@@ -931,7 +1080,7 @@ class Engine:
             except Exception as exc:  # noqa: BLE001
                 self.log(f"pause skipped: {exc}")
             try:
-                execute_plans(client, infohash, plans, host_save, log=self.log)
+                execute_plans(client, infohash, plans, host_save, log=self.log, resume=resume)
                 for plan in plans:
                     db.add_activity("ok", "重試成功，已更新 qBittorrent", name, plan["old_rel"], plan["new_rel"])
             except Exception as exc:  # noqa: BLE001
