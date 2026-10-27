@@ -74,7 +74,7 @@ Repo 要保持 **Public**。私人 repo 的下載網址要登入，Container Sta
 
 你自己暫停住的種子唔會被打開。失敗時檔案會留返 Filmix 的新名，不會刪檔，亦不會 Force Recheck。
 
-qBittorrent 5.3 的 renameFile／renameFolder 可以回 200，但種子路徑不變，除非新路徑已經在磁碟上。程式會先暫停種子，只在該種子的儲存目錄裡面搬內容（不會搬 Movies、西片、download 這些上一層），再呼叫 rename API 同步路徑，然後恢復做種。Filmix 已經放到最終路徑的檔案不會被拖回中途名。
+qBittorrent 5.3 的 renameFile／renameFolder 可以回 200，但種子路徑不變，除非新路徑已經在磁碟上。程式會先暫停種子，只在該種子的儲存目錄裡面搬內容（不會搬 Movies、西片、download 這些上一層），再呼叫 rename API 同步路徑，然後恢復做種。Filmix 已經放到最終路徑的檔案不會被拖回中途名。只改資料夾同檔案路徑，qBittorrent 的種子標題（顯示名稱）維持原樣，方便分辨同一套片的不同來源。
 
 ## 重試失敗的改名
 

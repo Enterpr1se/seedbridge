@@ -287,6 +287,9 @@ class DiskSyncQbit:
             new + name[len(old) :] if name == old or name.startswith(prefix) else name for name in self.names
         ]
 
+    def rename_torrent(self, _infohash, _name):
+        raise AssertionError("torrent Title must stay unchanged")
+
 
 def test_folder_fallback_to_rename_file():
     now, sleep = _clock()
@@ -483,6 +486,34 @@ def test_ensure_disk_stays_inside_save():
         assert not os.path.exists(os.path.join(save, "nope.iso"))
 
 
+def test_apply_leaves_torrent_title():
+    """Folder rename used to also rename the torrent Title. That API must not be called."""
+    assert not hasattr(engine.Qbit, "rename_torrent")
+    assert not hasattr(engine.Engine, "_touch_display_name")
+    with tempfile.TemporaryDirectory() as tmp:
+        old_rel = "Pete@HDSky/movie.iso"
+        new_rel = "Movie (2026) [tmdbid=1]/movie.iso"
+        host_new = os.path.join(tmp, new_rel)
+        os.makedirs(os.path.dirname(host_new), exist_ok=True)
+        with open(host_new, "w", encoding="utf-8") as handle:
+            handle.write("iso")
+        plans = [
+            {
+                "old_rel": old_rel,
+                "new_rel": new_rel,
+                "host_old": engine.norm_path(os.path.join(tmp, old_rel)),
+                "host_new": engine.norm_path(host_new),
+            }
+        ]
+        client = DiskSyncQbit([old_rel], tmp)
+        engine.db.init(os.path.join(tmp, "data"))
+        engine.Engine()._apply(client, "hash", "Pete@HDSky", plans, tmp, resume=False)
+        assert client.calls == [("folder", "Pete@HDSky", "Movie (2026) [tmdbid=1]")]
+        assert client.names == [new_rel]
+        assert open(host_new, encoding="utf-8").read() == "iso"
+        assert not client.started
+
+
 if __name__ == "__main__":
     test_stages()
     test_delayed_content_then_success()
@@ -494,5 +525,6 @@ if __name__ == "__main__":
     test_api_syncs_when_filmix_already_placed()
     test_same_folder_file_api_when_filmix_placed()
     test_ensure_disk_stays_inside_save()
+    test_apply_leaves_torrent_title()
     engine.self_test()
     print("test_rename ok")
