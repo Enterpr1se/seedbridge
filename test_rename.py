@@ -239,11 +239,16 @@ class FolderNoopQbit:
 
 
 class DiskSyncQbit:
-    """HTTP 200 always. Names change only when the destination path already exists."""
+    """HTTP 200 always. Downloaded names change only when the destination path exists.
 
-    def __init__(self, names, host_save):
+    metadata paths are never-downloaded entries: rename still updates their qB name
+    and must not require a file on disk.
+    """
+
+    def __init__(self, names, host_save, metadata=None):
         self.names = list(names)
         self.host_save = host_save
+        self.metadata = {engine.norm_path(name) for name in (metadata or [])}
         self.calls = []
         self.saw_dest = []
         self.trace = []
@@ -264,15 +269,23 @@ class DiskSyncQbit:
     def _ready(self, new):
         return os.path.lexists(os.path.join(self.host_save, new))
 
+    def _meta(self, name):
+        return engine.norm_path(name) in self.metadata
+
     def rename_file(self, _infohash, old, new):
         assert self.stopped and not self.started
         existed = self._ready(new)
         self.calls.append(("file", old, new))
         self.saw_dest.append(existed)
         self.trace.append("file")
-        if not existed or old not in self.names:
+        if old not in self.names:
+            return
+        if not existed and not self._meta(old):
             return
         self.names = [new if name == old else name for name in self.names]
+        if self._meta(old):
+            self.metadata.discard(engine.norm_path(old))
+            self.metadata.add(engine.norm_path(new))
 
     def rename_folder(self, _infohash, old, new):
         assert self.stopped and not self.started
@@ -280,12 +293,22 @@ class DiskSyncQbit:
         self.calls.append(("folder", old, new))
         self.saw_dest.append(existed)
         self.trace.append("folder")
-        if not existed:
-            return
         prefix = old + "/"
-        self.names = [
-            new + name[len(old) :] if name == old or name.startswith(prefix) else name for name in self.names
-        ]
+        updated = []
+        metadata = set()
+        for name in self.names:
+            covered = name == old or name.startswith(prefix)
+            if covered and (existed or self._meta(name)):
+                renamed = new + name[len(old) :]
+                updated.append(renamed)
+                if self._meta(name):
+                    metadata.add(engine.norm_path(renamed))
+            else:
+                updated.append(name)
+                if self._meta(name):
+                    metadata.add(engine.norm_path(name))
+        self.names = updated
+        self.metadata = metadata
 
     def rename_torrent(self, _infohash, _name):
         raise AssertionError("torrent Title must stay unchanged")
@@ -565,10 +588,11 @@ def test_skips_missing_sibling_under_folder_rename():
                 "host_new": engine.norm_path(os.path.join(tmp, missing_new)),
             },
         ]
-        client = DiskSyncQbit([present_old, missing_old], tmp)
+        client = DiskSyncQbit([present_old, missing_old], tmp, metadata=[missing_old])
         _run(client, plans, tmp)
         assert ("folder", "新特警判官.2012", "新特警判官 (2012) [tmdbid=1]") in client.calls
         assert present_new in client.names
+        assert missing_new in client.names
         assert os.path.isfile(host_new)
         assert open(host_new, encoding="utf-8").read() == "mkv"
         assert not os.path.exists(os.path.join(tmp, missing_old))
@@ -588,9 +612,11 @@ def test_only_missing_files_do_not_raise():
             }
         ]
         engine.align_disk_to_qbit(plans, {old_rel}, tmp)
-        client = DiskSyncQbit([old_rel], tmp)
+        client = DiskSyncQbit([old_rel], tmp, metadata=[old_rel])
         _run(client, plans, tmp)
-        assert client.calls == []
+        assert ("folder", "Old", "New") in client.calls
+        assert client.names == [new_rel]
+        assert not os.path.exists(os.path.join(tmp, old_rel))
         assert not os.path.exists(os.path.join(tmp, new_rel))
 
 

@@ -486,6 +486,8 @@ def plan_has_bytes(plan: dict, host_save: str) -> bool:
 
 def align_disk_to_qbit(plans: list[dict], names: set[str], host_save: str) -> None:
     for plan in plans:
+        if not plan_has_bytes(plan, host_save):
+            continue
         # Filmix/CloudDrive may already hold the final bytes. Leave them there;
         # waiting after renameFile accepts host_new in place of a missing mid.
         if os.path.lexists(plan["host_new"]):
@@ -633,10 +635,15 @@ def _ensure_disk_at(host_save: str, src_candidates: list[str], dest_rel: str) ->
 
 def _ensure_op_disk(op: dict, plans: list[dict], host_save: str) -> bool:
     if op["kind"] == "folder":
+        if not any(plan_has_bytes(plan, host_save) for plan in plans):
+            return False
         return _ensure_disk_at(host_save, [_disk_for(host_save, op["old"])], op["new"])
-    if _final_covers_mid(op, plans):
+    matched = [plan for plan in _matching_plans(op, plans) if plan_has_bytes(plan, host_save)]
+    if not matched:
         return False
-    return _ensure_disk_at(host_save, _file_sources(op, plans, host_save), op["new"])
+    if _final_covers_mid(op, matched):
+        return False
+    return _ensure_disk_at(host_save, _file_sources(op, matched, host_save), op["new"])
 
 
 def _client_quiet(client, name: str, infohash: str) -> None:
@@ -649,14 +656,46 @@ def _client_quiet(client, name: str, infohash: str) -> None:
         return
 
 
+def _disk_group_ready(group: list[str]) -> bool:
+    paths = [path for path in group if path]
+    if not paths:
+        return True
+    return any(os.path.lexists(path) for path in paths)
+
+
+def _byte_plans(plans: list[dict], host_save: str) -> list[dict]:
+    return [plan for plan in plans if plan_has_bytes(plan, host_save)]
+
+
+def _names_ready(plans: list[dict], names: set[str]) -> bool:
+    return all(norm_path(plan["new_rel"]) in names for plan in plans)
+
+
+def _downloaded_ready(plans: list[dict], names: set[str], host_save: str) -> bool:
+    downloaded = _byte_plans(plans, host_save)
+    return all(
+        norm_path(plan["new_rel"]) in names and os.path.lexists(plan["host_new"]) for plan in downloaded
+    )
+
+
+def _disk_groups_for(plans: list[dict], host_save: str) -> list[list[str]]:
+    groups = [[plan["host_new"]] for plan in plans if plan_has_bytes(plan, host_save)]
+    return groups or [[]]
+
+
+def _file_disk_groups(op: dict, plans: list[dict], host_save: str) -> list[list[str]]:
+    matched = [plan for plan in _matching_plans(op, plans) if plan_has_bytes(plan, host_save)]
+    if not matched:
+        return [[]]
+    return [_file_disk_alts(op, matched, host_save)]
+
+
 def _wait_ready(fetch, expect_rels: list[str], disk_groups: list[list[str]], timeout: float, pause: float, sleep, now) -> bool:
     deadline = now() + timeout
     while True:
         names = _names_of(fetch())
         rels_ok = all(norm_path(rel) in names for rel in expect_rels)
-        disks_ok = all(
-            any(os.path.lexists(path) for path in group if path) for group in disk_groups
-        )
+        disks_ok = all(_disk_group_ready(group) for group in disk_groups)
         if rels_ok and disks_ok:
             return True
         if now() >= deadline:
@@ -715,20 +754,19 @@ def execute_plans(
         if resume:
             _client_quiet(client, "start", infohash)
 
-    kept: list[dict] = []
     for plan in plans:
-        if plan_has_bytes(plan, host_save):
-            kept.append(plan)
-        else:
-            say(f"未下載或缺檔，已跳過 {plan.get('old_rel') or ''}")
-    plans = kept
+        if not plan_has_bytes(plan, host_save):
+            say(f"未下載：只更新 qB 路徑，不搬磁碟 {plan.get('old_rel') or ''}")
     if not plans:
-        say("沒有已下載的檔需要改名")
         _start()
         return
 
     names = _names_of(fetch())
-    if plans and all(norm_path(plan["new_rel"]) in names and os.path.lexists(plan["host_new"]) for plan in plans):
+    if plans and all(
+        norm_path(plan["new_rel"]) in names
+        and (not plan_has_bytes(plan, host_save) or os.path.lexists(plan["host_new"]))
+        for plan in plans
+    ):
         say("qBittorrent 已是新路徑")
         _start()
         return
@@ -746,7 +784,7 @@ def execute_plans(
             if op["kind"] == "folder":
                 client.rename_folder(infohash, op["old"], op["new"])
                 expect_rels = [plan["new_rel"] for plan in plans]
-                disk_groups = [[plan["host_new"]] for plan in plans]
+                disk_groups = _disk_groups_for(plans, host_save)
                 label = "資料夾"
                 if _wait_ready(fetch, expect_rels, disk_groups, timeout, pause, sleep, now):
                     continue
@@ -756,27 +794,39 @@ def execute_plans(
                     current = _qbit_rel(plan, names_now)
                     if norm_path(current) == norm_path(plan["new_rel"]):
                         continue
-                    if _ensure_disk_at(host_save, _plan_file_sources(plan, host_save, current), plan["new_rel"]):
+                    if plan_has_bytes(plan, host_save) and _ensure_disk_at(
+                        host_save, _plan_file_sources(plan, host_save, current), plan["new_rel"]
+                    ):
                         say(f"磁碟已搬到 {plan['new_rel']}")
                     client.rename_file(infohash, current, plan["new_rel"])
-                if not _wait_ready(fetch, expect_rels, disk_groups, timeout, pause, sleep, now):
+                if _wait_ready(fetch, expect_rels, disk_groups, timeout, pause, sleep, now):
+                    continue
+                if _byte_plans(plans, host_save) and not _downloaded_ready(plans, _names_of(fetch()), host_save):
                     raise RenameFailed(f"qBittorrent 未完成改名（{label}）：{op['new']}")
+                for plan in plans:
+                    if plan_has_bytes(plan, host_save):
+                        continue
+                    if norm_path(plan["new_rel"]) not in _names_of(fetch()):
+                        say(f"未下載：qB 路徑未跟上 {plan['old_rel']}")
                 continue
             client.rename_file(infohash, op["old"], op["new"])
             expect_rels = [op["new"]]
-            disk_groups = [_file_disk_alts(op, plans, host_save)]
+            disk_groups = _file_disk_groups(op, plans, host_save)
             label = "檔名"
-            if not _wait_ready(fetch, expect_rels, disk_groups, timeout, pause, sleep, now):
+            if _wait_ready(fetch, expect_rels, disk_groups, timeout, pause, sleep, now):
+                continue
+            if any(plan_has_bytes(plan, host_save) for plan in _matching_plans(op, plans)):
                 raise RenameFailed(f"qBittorrent 未完成改名（{label}）：{op['new']}")
+            say(f"未下載：qB 路徑未跟上 {op['new']}")
     except Exception as exc:
         try:
-            finals = all(norm_path(plan["new_rel"]) in _names_of(fetch()) for plan in plans) and all(
-                os.path.lexists(plan["host_new"]) for plan in plans
-            )
+            downloaded = _byte_plans(plans, host_save)
+            downloaded_ok = _downloaded_ready(plans, _names_of(fetch()), host_save)
         except Exception:
-            finals = False
-        if finals:
-            say("qBittorrent 已跟上最終路徑")
+            downloaded = [plans[0]] if plans else [None]
+            downloaded_ok = False
+        if not downloaded or downloaded_ok:
+            say("qBittorrent 已跟上最終路徑" if downloaded_ok else "未下載的檔未能全部更新 qB 路徑，已略過")
             _start()
             return
         try:
@@ -986,9 +1036,8 @@ class Engine:
                     "host_new": new_host,
                 }
                 if not plan_has_bytes(draft, host_save):
-                    db.add_activity("skip", "未下載或缺檔，已跳過", tor.get("name") or "", rel, new_rel)
-                    self.log(f"未下載或缺檔，已跳過 {rel}")
-                    continue
+                    db.add_activity("skip", "未下載：只更新 qB 路徑，不搬磁碟", tor.get("name") or "", rel, new_rel)
+                    self.log(f"未下載：只更新 qB 路徑，不搬磁碟 {rel}")
                 plans.append(draft)
             if plans:
                 plans_by_hash[infohash] = {"torrent": tor, "host_save": host_save, "plans": plans, "files": files}
