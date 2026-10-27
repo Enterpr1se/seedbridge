@@ -17,6 +17,7 @@ _conn: sqlite3.Connection | None = None
 DEFAULT_SETTINGS = {
     "enabled": False,
     "dry_run": True,
+    "rename_torrent_title": False,
     "debounce_sec": 8,
     "webhook_token": "",
     "qb": {
@@ -204,6 +205,7 @@ def save_settings(data: dict) -> dict:
     stored = {
         "enabled": bool(data.get("enabled")),
         "dry_run": bool(data.get("dry_run")),
+        "rename_torrent_title": bool(data.get("rename_torrent_title")),
         "debounce_sec": debounce,
         "webhook_token": token,
         "qb": {

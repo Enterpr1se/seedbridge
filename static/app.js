@@ -235,6 +235,7 @@ function formSettings() {
   return {
     enabled: Boolean(auto.enabled),
     dry_run: Boolean(auto.dry_run),
+    rename_torrent_title: Boolean(auto.rename_torrent_title),
     debounce_sec: Number(auto.debounce_sec || 8),
     webhook_token: auto.webhook_token || "",
     qb: {
@@ -269,6 +270,7 @@ function fillSettings() {
   auto.debounce_sec.value = settings.debounce_sec || 8;
   auto.enabled.checked = Boolean(settings.enabled);
   auto.dry_run.checked = Boolean(settings.dry_run);
+  auto.rename_torrent_title.checked = Boolean(settings.rename_torrent_title);
   auto.webhook_token.value = settings.webhook_token || "";
   hookToken = settings.webhook_token || "";
   const maps = document.querySelector("#maps");

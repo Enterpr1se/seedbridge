@@ -223,6 +223,9 @@ class Qbit:
             {"hash": infohash, "oldPath": old, "newPath": new},
         )
 
+    def rename_torrent(self, infohash: str, name: str) -> None:
+        self.call("POST", "/api/v2/torrents/rename", {"hash": infohash, "name": name})
+
 
 def probe_qb(settings: dict) -> dict:
     host = (settings.get("qb") or {}).get("host") or ""
@@ -988,6 +991,7 @@ class Engine:
                     infohash,
                     name,
                     plans,
+                    bag["files"],
                     bag["host_save"],
                     resume=state not in USER_PAUSED,
                 )
@@ -1005,6 +1009,7 @@ class Engine:
         infohash: str,
         name: str,
         plans: list[dict],
+        files: list[dict],
         host_save: str,
         resume: bool,
     ) -> None:
@@ -1028,6 +1033,9 @@ class Engine:
             execute_plans(client, infohash, plans, host_save, log=self.log, resume=resume)
             for plan in plans:
                 db.add_activity("ok", "已自動更新路徑，並恢復做種", name, plan["old_rel"], plan["new_rel"])
+            if db.get_settings().get("rename_torrent_title"):
+                all_rels = [str(item.get("name") or "") for item in files]
+                self._touch_display_name(client, infohash, plans, all_rels)
         except Exception as exc:
             if not getattr(exc, "retry", ""):
                 exc.retry = blob
@@ -1089,6 +1097,23 @@ class Engine:
         finally:
             with self.lock:
                 self._retries.discard(activity_id)
+
+    def _touch_display_name(self, client: Qbit, infohash: str, plans: list[dict], all_rels: list[str]) -> None:
+        old_roots = {plan["old_rel"].split("/", 1)[0] for plan in plans if "/" in plan["old_rel"]}
+        new_roots = {plan["new_rel"].split("/", 1)[0] for plan in plans if "/" in plan["new_rel"]}
+        if len(old_roots) != 1 or len(new_roots) != 1 or old_roots == new_roots:
+            return
+        old_root, new_root = next(iter(old_roots)), next(iter(new_roots))
+        if not all_rels or not all(rel == old_root or rel.startswith(old_root + "/") for rel in all_rels):
+            return
+        if not all(rel in {plan["old_rel"] for plan in plans} for rel in all_rels):
+            return
+        try:
+            client.rename_torrent(infohash, new_root)
+        except AssertionError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"display name skipped: {exc}")
 
 
 def self_test() -> None:

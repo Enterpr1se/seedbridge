@@ -486,32 +486,58 @@ def test_ensure_disk_stays_inside_save():
         assert not os.path.exists(os.path.join(save, "nope.iso"))
 
 
+def _title_case(tmp: str):
+    old_rel = "Pete@HDSky/movie.iso"
+    new_rel = "Movie (2026) [tmdbid=1]/movie.iso"
+    host_new = os.path.join(tmp, new_rel)
+    os.makedirs(os.path.dirname(host_new), exist_ok=True)
+    with open(host_new, "w", encoding="utf-8") as handle:
+        handle.write("iso")
+    plans = [
+        {
+            "old_rel": old_rel,
+            "new_rel": new_rel,
+            "host_old": engine.norm_path(os.path.join(tmp, old_rel)),
+            "host_new": engine.norm_path(host_new),
+        }
+    ]
+    files = [{"name": old_rel}]
+    return old_rel, new_rel, host_new, plans, files
+
+
 def test_apply_leaves_torrent_title():
-    """Folder rename used to also rename the torrent Title. That API must not be called."""
-    assert not hasattr(engine.Qbit, "rename_torrent")
-    assert not hasattr(engine.Engine, "_touch_display_name")
+    """Title rename stays off unless rename_torrent_title is set."""
     with tempfile.TemporaryDirectory() as tmp:
-        old_rel = "Pete@HDSky/movie.iso"
-        new_rel = "Movie (2026) [tmdbid=1]/movie.iso"
-        host_new = os.path.join(tmp, new_rel)
-        os.makedirs(os.path.dirname(host_new), exist_ok=True)
-        with open(host_new, "w", encoding="utf-8") as handle:
-            handle.write("iso")
-        plans = [
-            {
-                "old_rel": old_rel,
-                "new_rel": new_rel,
-                "host_old": engine.norm_path(os.path.join(tmp, old_rel)),
-                "host_new": engine.norm_path(host_new),
-            }
-        ]
+        old_rel, new_rel, host_new, plans, files = _title_case(tmp)
         client = DiskSyncQbit([old_rel], tmp)
         engine.db.init(os.path.join(tmp, "data"))
-        engine.Engine()._apply(client, "hash", "Pete@HDSky", plans, tmp, resume=False)
+        assert engine.db.get_settings().get("rename_torrent_title") is False
+        engine.Engine()._apply(client, "hash", "Pete@HDSky", plans, files, tmp, resume=False)
         assert client.calls == [("folder", "Pete@HDSky", "Movie (2026) [tmdbid=1]")]
         assert client.names == [new_rel]
         assert open(host_new, encoding="utf-8").read() == "iso"
         assert not client.started
+
+
+def test_apply_renames_torrent_title_when_enabled():
+    with tempfile.TemporaryDirectory() as tmp:
+        old_rel, new_rel, host_new, plans, files = _title_case(tmp)
+        client = DiskSyncQbit([old_rel], tmp)
+        titles = []
+
+        def rename_torrent(infohash, title):
+            titles.append((infohash, title))
+
+        client.rename_torrent = rename_torrent
+        engine.db.init(os.path.join(tmp, "data"))
+        stored = engine.db.get_settings()
+        stored["rename_torrent_title"] = True
+        engine.db.save_settings(stored)
+        assert engine.db.get_settings()["rename_torrent_title"] is True
+        engine.Engine()._apply(client, "hash", "Pete@HDSky", plans, files, tmp, resume=False)
+        assert titles == [("hash", "Movie (2026) [tmdbid=1]")]
+        assert client.names == [new_rel]
+        assert open(host_new, encoding="utf-8").read() == "iso"
 
 
 if __name__ == "__main__":
@@ -526,5 +552,6 @@ if __name__ == "__main__":
     test_same_folder_file_api_when_filmix_placed()
     test_ensure_disk_stays_inside_save()
     test_apply_leaves_torrent_title()
+    test_apply_renames_torrent_title_when_enabled()
     engine.self_test()
     print("test_rename ok")
