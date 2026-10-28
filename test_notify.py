@@ -155,6 +155,36 @@ def test_disk_poster_and_tmdb_fallback():
         assert all(b"secret-key" not in (item.data or b"") for item in calls if "api.telegram.org" in item.full_url)
 
 
+def test_no_tmdb_without_key():
+    calls = []
+
+    def urlopen(request, timeout=20):
+        calls.append(request)
+        return _Body(b"{}")
+
+    saved = os.environ.pop("TMDB_API_KEY", None)
+    try:
+        assert notify.notify_now(
+            "ok",
+            "Show",
+            "Old/a.mkv",
+            "Movie [tmdbid=9]/a.mkv",
+            poster_dir="/no/such/folder",
+            settings={"telegram_bot_token": "123:ABC", "telegram_chat_id": "42", "tmdb_api_key": ""},
+            urlopen=urlopen,
+        )
+    finally:
+        if saved is not None:
+            os.environ["TMDB_API_KEY"] = saved
+    assert len(calls) == 1
+    assert calls[0].full_url.endswith("/sendMessage")
+    assert "themoviedb.org" not in calls[0].full_url
+    body = json.loads(calls[0].data.decode("utf-8"))
+    assert "成功改名" in body["text"]
+    for word in FORBIDDEN:
+        assert word not in body["text"]
+
+
 def test_secrets_stay_masked():
     with tempfile.TemporaryDirectory() as tmp:
         db.init(tmp)
@@ -182,6 +212,7 @@ if __name__ == "__main__":
     test_success_caption()
     test_failure_caption()
     test_telegram_send_respects_token()
+    test_no_tmdb_without_key()
     test_disk_poster_and_tmdb_fallback()
     test_secrets_stay_masked()
     print("test_notify ok")
