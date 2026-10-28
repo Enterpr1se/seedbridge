@@ -1,7 +1,7 @@
 FROM python:3.12-alpine
 
 WORKDIR /app
-COPY db.py engine.py app.py /app/
+COPY db.py engine.py app.py notify.py /app/
 COPY static /app/static
 
 ENV DATA_DIR=/data \

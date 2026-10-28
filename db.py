@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import sqlite3
 import threading
@@ -29,6 +30,10 @@ DEFAULT_SETTINGS = {
     },
     "clouddrive": {"host": "", "port": 19798, "https": False},
     "maps": [{"cd_prefix": "", "local_prefix": "/media", "qbit_prefix": "/downloads"}],
+    "watch_folders": "",
+    "telegram_bot_token": "",
+    "telegram_chat_id": "",
+    "tmdb_api_key": "",
 }
 
 
@@ -221,11 +226,22 @@ def save_settings(data: dict) -> dict:
             "https": bool(cd.get("https")),
         },
         "maps": maps,
+        "watch_folders": str(data.get("watch_folders") or "").strip(),
+        "telegram_bot_token": _keep_secret(data.get("telegram_bot_token"), current.get("telegram_bot_token")),
+        "telegram_chat_id": str(data.get("telegram_chat_id") or "").strip(),
+        "tmdb_api_key": _keep_secret(data.get("tmdb_api_key"), current.get("tmdb_api_key")),
     }
     with _lock:
         _db().execute("UPDATE settings SET json = ? WHERE id = 1", (json.dumps(stored),))
         _db().commit()
     return stored
+
+
+def _keep_secret(incoming, previous) -> str:
+    value = str(incoming or "").strip()
+    if value:
+        return value
+    return str(previous or "")
 
 
 def public_settings(data: dict | None = None) -> dict:
@@ -234,6 +250,10 @@ def public_settings(data: dict | None = None) -> dict:
     qb["password_set"] = bool(qb.get("password"))
     qb["password"] = ""
     data["qb"] = qb
+    data["telegram_token_set"] = bool(str(data.get("telegram_bot_token") or "").strip())
+    data["telegram_bot_token"] = ""
+    data["tmdb_api_key_set"] = bool(str(data.get("tmdb_api_key") or "").strip() or os.environ.get("TMDB_API_KEY", "").strip())
+    data["tmdb_api_key"] = ""
     return data
 
 
@@ -244,6 +264,9 @@ def add_activity(
     old_path: str = "",
     new_path: str = "",
     retry: str = "",
+    *,
+    announce: bool = False,
+    poster_dir: str = "",
 ) -> None:
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     with _lock:
@@ -253,6 +276,13 @@ def add_activity(
         )
         _db().execute("DELETE FROM activity WHERE id NOT IN (SELECT id FROM activity ORDER BY id DESC LIMIT 2000)")
         _db().commit()
+    if announce and status in {"ok", "error"}:
+        try:
+            import notify
+
+            notify.schedule(status, torrent, old_path, new_path, detail, poster_dir)
+        except Exception:
+            pass
 
 
 def list_activity(limit: int = 200) -> list[dict]:

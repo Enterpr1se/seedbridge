@@ -65,6 +65,12 @@ Repo 要保持 **Public**。私人 repo 的下載網址要登入，Container Sta
 
 三欄的剩餘部分必須一樣。先按「檢查容器內目錄」，確認 `/media` 睇到影片。
 
+## 監控目錄同 Telegram
+
+監控目錄留空就處理全部已對應路徑。多個目錄用 `;` 隔開，例如 `/115/Video/Movie;/115/Video/TV`。目錄以外的 CloudDrive 改名會直接忽略，不會寫進改名紀錄。
+
+填 Telegram Bot Token 同 Chat ID 之後，改名成功會發「成功改名」，並附上新資料夾裡的 poster（`poster.jpg`、`folder.jpg`、`cover.jpg` 或 png）。磁碟沒有圖、但路徑有 `[tmdbid=]` 而且填了 TMDB API Key 時，才會向 TMDB 取海報。失敗只發路徑同檔案名，不會附評分、類型或劇情。
+
 建議第一次：
 
 1. 勾「接收 webhook 並處理」。

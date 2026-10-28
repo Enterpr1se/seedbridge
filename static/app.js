@@ -232,12 +232,17 @@ function formSettings() {
   const qb = Object.fromEntries(new FormData(document.querySelector("#form-qb")));
   const cd = Object.fromEntries(new FormData(document.querySelector("#form-cd")));
   const auto = Object.fromEntries(new FormData(document.querySelector("#form-auto")));
+  const notify = Object.fromEntries(new FormData(document.querySelector("#form-notify")));
   return {
     enabled: Boolean(auto.enabled),
     dry_run: Boolean(auto.dry_run),
     rename_torrent_title: Boolean(auto.rename_torrent_title),
     debounce_sec: Number(auto.debounce_sec || 8),
     webhook_token: auto.webhook_token || "",
+    watch_folders: notify.watch_folders || "",
+    telegram_bot_token: notify.telegram_bot_token || "",
+    telegram_chat_id: notify.telegram_chat_id || "",
+    tmdb_api_key: notify.tmdb_api_key || "",
     qb: {
       host: qb.host || "",
       port: Number(qb.port || 8080),
@@ -273,6 +278,13 @@ function fillSettings() {
   auto.rename_torrent_title.checked = Boolean(settings.rename_torrent_title);
   auto.webhook_token.value = settings.webhook_token || "";
   hookToken = settings.webhook_token || "";
+  const notify = document.querySelector("#form-notify");
+  notify.watch_folders.value = settings.watch_folders || "";
+  notify.telegram_bot_token.value = "";
+  notify.telegram_bot_token.placeholder = settings.telegram_token_set ? "已儲存，留空不改" : "留空不改";
+  notify.telegram_chat_id.value = settings.telegram_chat_id || "";
+  notify.tmdb_api_key.value = "";
+  notify.tmdb_api_key.placeholder = settings.tmdb_api_key_set ? "已儲存，留空不改" : "留空不改";
   const maps = document.querySelector("#maps");
   maps.replaceChildren();
   (settings.maps || []).forEach((item) => maps.append(mapRow(item)));

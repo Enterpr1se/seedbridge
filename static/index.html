@@ -169,6 +169,25 @@
           </label>
           <p class="hint" id="raw-hint"></p>
         </form>
+
+        <form id="form-notify" class="card">
+          <h2>監控同通知</h2>
+          <label class="field">
+            <span>監控目錄</span>
+            <textarea name="watch_folders" rows="3" placeholder="/115/Video/Movie;/115/Video/TV"></textarea>
+          </label>
+          <p class="hint">多個用 ; 隔開；留空＝全部。只處理這些目錄底下的改名。</p>
+          <label class="field">
+            <span>Telegram Bot Token</span>
+            <input name="telegram_bot_token" type="password" autocomplete="new-password" placeholder="留空不改" />
+          </label>
+          <label class="field"><span>Chat ID</span><input name="telegram_chat_id" autocomplete="off" placeholder="例如 123456789" /></label>
+          <label class="field">
+            <span>TMDB API Key／Read Access</span>
+            <input name="tmdb_api_key" type="password" autocomplete="new-password" placeholder="留空不改" />
+          </label>
+          <p class="hint">成功會發「成功改名」，資料夾有 poster 就一併送出。失敗只發路徑同檔案名。</p>
+        </form>
       </section>
     </main>
   </div>

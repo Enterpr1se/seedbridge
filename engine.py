@@ -58,6 +58,19 @@ def under(parent: str, child: str) -> bool:
     return child == parent or child.startswith(parent + "/")
 
 
+def path_watched(settings: dict, src_raw: str, dst_raw: str, local_src: str | None, local_dst: str | None) -> bool:
+    prefixes = [norm_path(part) for part in str(settings.get("watch_folders") or "").split(";") if part.strip()]
+    if not prefixes:
+        return True
+    for path in (src_raw, dst_raw, local_src or "", local_dst or ""):
+        if not path:
+            continue
+        for prefix in prefixes:
+            if under(prefix, path):
+                return True
+    return False
+
+
 def apply_chain(path: str, events: list[dict]) -> str:
     current = norm_path(path)
     for event in events:
@@ -908,6 +921,8 @@ class Engine:
             is_dir = str(item.get("is_dir", "")).lower() in {"1", "true", "yes"}
             local_src = cd_to_local(src_raw, maps)
             local_dst = cd_to_local(dst_raw, maps)
+            if not path_watched(settings, src_raw, dst_raw, local_src, local_dst):
+                continue
             db.add_activity("recv", "收到 CloudDrive 改名", "", src_raw, dst_raw)
             if local_src is None or local_dst is None:
                 db.add_activity(
@@ -960,7 +975,7 @@ class Engine:
                     self._process(batch)
                 except Exception as exc:  # noqa: BLE001
                     self.last_report = f"處理失敗：{exc}"
-                    db.add_activity("error", self.last_report)
+                    db.add_activity("error", self.last_report, announce=True)
                     self.log(self.last_report)
 
     def _process(self, batch: list[dict]) -> None:
@@ -1010,7 +1025,14 @@ class Engine:
                 host_file = norm_path(host_save + "/" + rel)
                 new_host = choose_new_host(host_file, batch)
                 if new_host is None:
-                    db.add_activity("error", "同一個檔有多於一個可能的新路徑，已跳過", tor.get("name") or "", host_file, "")
+                    db.add_activity(
+                        "error",
+                        "同一個檔有多於一個可能的新路徑，已跳過",
+                        tor.get("name") or "",
+                        host_file,
+                        "",
+                        announce=True,
+                    )
                     continue
                 if new_host == host_file:
                     continue
@@ -1072,7 +1094,15 @@ class Engine:
                 done += len(plans)
             except Exception as exc:  # noqa: BLE001
                 blob = getattr(exc, "retry", "") or _retry_blob(infohash, name, bag["host_save"], plans)
-                db.add_activity("error", str(exc), name, plans[0]["old_rel"], plans[0]["new_rel"], blob)
+                db.add_activity(
+                    "error",
+                    str(exc),
+                    name,
+                    plans[0]["old_rel"],
+                    plans[0]["new_rel"],
+                    blob,
+                    announce=True,
+                )
                 self.log(f"{infohash[:8]} {exc}")
         self.last_report = f"{'已記錄' if dry else '已自動對齊'} {done} 個路徑"
         self.log(self.last_report)
@@ -1106,7 +1136,15 @@ class Engine:
         try:
             execute_plans(client, infohash, plans, host_save, log=self.log, resume=resume)
             for plan in plans:
-                db.add_activity("ok", "已自動更新路徑，並恢復做種", name, plan["old_rel"], plan["new_rel"])
+                db.add_activity(
+                    "ok",
+                    "已自動更新路徑，並恢復做種",
+                    name,
+                    plan["old_rel"],
+                    plan["new_rel"],
+                    announce=True,
+                    poster_dir=os.path.dirname(plan["host_new"]),
+                )
             if db.get_settings().get("rename_torrent_title"):
                 all_rels = [str(item.get("name") or "") for item in files]
                 self._touch_display_name(client, infohash, plans, all_rels)
@@ -1157,10 +1195,26 @@ class Engine:
             try:
                 execute_plans(client, infohash, plans, host_save, log=self.log, resume=resume)
                 for plan in plans:
-                    db.add_activity("ok", "重試成功，已更新 qBittorrent", name, plan["old_rel"], plan["new_rel"])
+                    db.add_activity(
+                        "ok",
+                        "重試成功，已更新 qBittorrent",
+                        name,
+                        plan["old_rel"],
+                        plan["new_rel"],
+                        announce=True,
+                        poster_dir=os.path.dirname(plan.get("host_new") or ""),
+                    )
             except Exception as exc:  # noqa: BLE001
                 blob = getattr(exc, "retry", "") or raw
-                db.add_activity("error", str(exc), name, plans[0]["old_rel"], plans[0]["new_rel"], blob)
+                db.add_activity(
+                    "error",
+                    str(exc),
+                    name,
+                    plans[0]["old_rel"],
+                    plans[0]["new_rel"],
+                    blob,
+                    announce=True,
+                )
                 self.log(f"retry {infohash[:8]} {exc}")
             finally:
                 if resume:
