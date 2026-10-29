@@ -28,7 +28,7 @@ _TMDB_ID = re.compile(r"\[tmdbid=(\d+)\]", re.IGNORECASE)
 
 
 def success_text(torrent: str, old_path: str, new_path: str) -> str:
-    lines = ["成功改名"]
+    lines = ["已成功改名"]
     if torrent:
         lines.append(torrent)
     if old_path or new_path:
@@ -117,6 +117,85 @@ def fetch_tmdb_poster(hint: str, key: str, urlopen=None) -> tuple[bytes, str] | 
     return body, ext
 
 
+def _strip_forbidden(text: str) -> str:
+    clean = text or ""
+    for word in FORBIDDEN:
+        clean = clean.replace(word, "")
+    return clean
+
+
+def _as_items(items) -> list:
+    if not items:
+        return []
+    return list(items)
+
+
+def _item_label(item) -> str:
+    if isinstance(item, str):
+        return item.strip()
+    if not isinstance(item, dict):
+        return str(item or "").strip()
+    for key in ("path", "file", "name", "new", "old"):
+        value = str(item.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def job_text(torrent: str = "", ok=None, failed=None, detail: str = "") -> str:
+    """One caption for a torrent. Lists failed paths only when there are at most 10."""
+    ok_items = _as_items(ok)
+    failed_items = _as_items(failed)
+    n_ok = len(ok_items)
+    n_fail = len(failed_items)
+    labels = [label for label in (_item_label(item) for item in failed_items) if label]
+    lines = ["已成功改名" if n_ok else "改名失敗"]
+    if str(torrent or "").strip():
+        lines.append(str(torrent).strip())
+    lines.append(f"成功 {n_ok} 個，失敗 {n_fail} 個")
+    clean_detail = _strip_forbidden(detail or "").strip()
+    fail_lines: list[str] = []
+    if n_fail > 10:
+        fail_lines.append("失敗超過 10 個，請查看 SeedBridge 紀錄")
+        clean_detail = ""
+    elif labels:
+        fail_lines.append("失敗檔案：")
+        fail_lines.extend(_strip_forbidden(label).strip() for label in labels)
+    if clean_detail:
+        fail_lines.append(clean_detail[:400])
+    fail_block = _strip_forbidden("\n".join(line for line in fail_lines if line.strip()))
+    text = "\n".join(lines)
+    if fail_block:
+        text = text + "\n" + fail_block
+    if not n_ok:
+        text = _strip_forbidden(text)
+    return text[:1000]
+
+
+def _first_poster_dir(ok) -> str:
+    for item in _as_items(ok):
+        if isinstance(item, dict):
+            folder = str(item.get("poster_dir") or "").strip()
+            if not folder:
+                new = str(item.get("new") or item.get("path") or "").strip()
+                folder = os.path.dirname(new) if new else ""
+        else:
+            folder = os.path.dirname(str(item or "").strip())
+        if folder:
+            return folder
+    return ""
+
+
+def _poster_hint(ok) -> str:
+    parts: list[str] = []
+    for item in _as_items(ok):
+        if isinstance(item, dict):
+            parts.extend(str(item.get(key) or "") for key in ("new", "old", "path", "poster_dir"))
+        else:
+            parts.append(str(item or ""))
+    return "\n".join(parts)
+
+
 def _multipart(fields: dict[str, str], filename: str, content: bytes, mime: str) -> tuple[str, bytes]:
     boundary = "----SeedBridgeBoundary"
     chunks: list[bytes] = []
@@ -136,58 +215,42 @@ def _multipart(fields: dict[str, str], filename: str, content: bytes, mime: str)
     return boundary, b"".join(chunks)
 
 
-def notify_now(
-    status: str,
-    torrent: str = "",
-    old_path: str = "",
-    new_path: str = "",
-    detail: str = "",
-    poster_dir: str = "",
-    settings: dict | None = None,
-    urlopen=None,
-) -> bool:
-    if status not in {"ok", "error"}:
-        return False
+def _credentials(settings: dict | None) -> tuple[str, str] | None:
     settings = settings or {}
     token = str(settings.get("telegram_bot_token") or "").strip()
     chat = str(settings.get("telegram_chat_id") or "").strip()
     if not token or not chat:
-        return False
-    opener = urlopen or urllib.request.urlopen
-    if status == "ok":
-        text = success_text(torrent, old_path, new_path)
-        photo = find_disk_poster(poster_dir)
-        payload = None
-        filename = "poster.jpg"
-        mime = "image/jpeg"
-        if photo:
-            with open(photo, "rb") as handle:
-                payload = handle.read()
-            filename = os.path.basename(photo)
-            mime = "image/png" if filename.lower().endswith(".png") else "image/jpeg"
-        else:
-            fetched = fetch_tmdb_poster(f"{old_path}\n{new_path}\n{poster_dir}", tmdb_key(settings), opener)
-            if fetched:
-                payload, ext = fetched
-                filename = "poster." + ext
-                mime = "image/png" if ext == "png" else "image/jpeg"
-        if payload:
-            boundary, body = _multipart({"chat_id": chat, "caption": text}, filename, payload, mime)
-            request = urllib.request.Request(
-                f"https://api.telegram.org/bot{token}/sendPhoto",
-                data=body,
-                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-                method="POST",
-            )
-        else:
-            request = urllib.request.Request(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                data=json.dumps({"chat_id": chat, "text": text}).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
+        return None
+    return token, chat
+
+
+def _load_poster(poster_dir: str, hint: str, settings: dict, opener):
+    photo = find_disk_poster(poster_dir)
+    if photo:
+        with open(photo, "rb") as handle:
+            payload = handle.read()
+        filename = os.path.basename(photo)
+        mime = "image/png" if filename.lower().endswith(".png") else "image/jpeg"
+        return payload, filename, mime
+    fetched = fetch_tmdb_poster(hint, tmdb_key(settings), opener)
+    if not fetched:
+        return None
+    payload, ext = fetched
+    mime = "image/png" if ext == "png" else "image/jpeg"
+    return payload, "poster." + ext, mime
+
+
+def _deliver(token: str, chat: str, text: str, poster, opener) -> bool:
+    if poster:
+        payload, filename, mime = poster
+        boundary, body = _multipart({"chat_id": chat, "caption": text}, filename, payload, mime)
+        request = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendPhoto",
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
     else:
-        text = failure_text(torrent, old_path, new_path, detail)
         request = urllib.request.Request(
             f"https://api.telegram.org/bot{token}/sendMessage",
             data=json.dumps({"chat_id": chat, "text": text}).encode("utf-8"),
@@ -202,6 +265,71 @@ def notify_now(
     return True
 
 
+def notify_now(
+    status: str,
+    torrent: str = "",
+    old_path: str = "",
+    new_path: str = "",
+    detail: str = "",
+    poster_dir: str = "",
+    settings: dict | None = None,
+    urlopen=None,
+) -> bool:
+    if status not in {"ok", "error"}:
+        return False
+    creds = _credentials(settings)
+    if not creds:
+        return False
+    token, chat = creds
+    settings = settings or {}
+    opener = urlopen or urllib.request.urlopen
+    poster = None
+    if status == "ok":
+        text = success_text(torrent, old_path, new_path)
+        poster = _load_poster(poster_dir, f"{old_path}\n{new_path}\n{poster_dir}", settings, opener)
+    else:
+        text = failure_text(torrent, old_path, new_path, detail)
+    return _deliver(token, chat, text, poster, opener)
+
+
+def notify_job(
+    torrent: str = "",
+    ok=None,
+    failed=None,
+    detail: str = "",
+    settings: dict | None = None,
+    urlopen=None,
+) -> bool:
+    ok_items = _as_items(ok)
+    failed_items = _as_items(failed)
+    detail = str(detail or "")
+    if not ok_items and not failed_items and not detail.strip():
+        return False
+    creds = _credentials(settings)
+    if not creds:
+        return False
+    token, chat = creds
+    settings = settings or {}
+    opener = urlopen or urllib.request.urlopen
+    text = job_text(torrent, ok_items, failed_items, detail)
+    poster = None
+    if ok_items:
+        poster = _load_poster(_first_poster_dir(ok_items), _poster_hint(ok_items), settings, opener)
+    return _deliver(token, chat, text, poster, opener)
+
+
+def _stored_settings() -> dict | None:
+    try:
+        import db
+
+        settings = db.get_settings()
+    except Exception:
+        return None
+    if not _credentials(settings):
+        return None
+    return settings
+
+
 def schedule(
     status: str,
     torrent: str = "",
@@ -212,15 +340,8 @@ def schedule(
 ) -> None:
     if status not in {"ok", "error"}:
         return
-    try:
-        import db
-
-        settings = db.get_settings()
-    except Exception:
-        return
-    if not str(settings.get("telegram_bot_token") or "").strip():
-        return
-    if not str(settings.get("telegram_chat_id") or "").strip():
+    settings = _stored_settings()
+    if not settings:
         return
     threading.Thread(
         target=_safe,
@@ -230,8 +351,32 @@ def schedule(
     ).start()
 
 
+def schedule_job(torrent: str = "", ok=None, failed=None, detail: str = "") -> None:
+    ok_items = _as_items(ok)
+    failed_items = _as_items(failed)
+    detail = str(detail or "")
+    if not ok_items and not failed_items and not detail.strip():
+        return
+    settings = _stored_settings()
+    if not settings:
+        return
+    threading.Thread(
+        target=_safe_job,
+        args=(torrent, ok_items, failed_items, detail, settings),
+        name="telegram-job",
+        daemon=True,
+    ).start()
+
+
 def _safe(status, torrent, old_path, new_path, detail, poster_dir, settings) -> None:
     try:
         notify_now(status, torrent, old_path, new_path, detail, poster_dir, settings)
+    except Exception as exc:  # noqa: BLE001
+        print("telegram notify failed", type(exc).__name__, flush=True)
+
+
+def _safe_job(torrent, ok, failed, detail, settings) -> None:
+    try:
+        notify_job(torrent, ok, failed, detail, settings)
     except Exception as exc:  # noqa: BLE001
         print("telegram notify failed", type(exc).__name__, flush=True)

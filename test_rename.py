@@ -6,6 +6,17 @@ import tempfile
 import engine
 
 
+class _QuietTemp(tempfile.TemporaryDirectory):
+    """SQLite keeps the temp db open on Windows, so cleanup must not fail the test."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("ignore_cleanup_errors", True)
+        super().__init__(*args, **kwargs)
+
+
+tempfile.TemporaryDirectory = _QuietTemp
+
+
 OLD = "穿普拉达的女王2 The Devil Wears Prada 2/The Devil Wears Prada 2.iso"
 NEW = "穿普拉达的女王2 (2026) [tmdbid=1314481]/穿普拉达的女王2 (2026).iso"
 PLANS = [

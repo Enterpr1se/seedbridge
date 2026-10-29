@@ -15,7 +15,7 @@ https://github.com/Enterpr1se/seedbridge/releases/latest/download/seedbridge.tar
 目前這個版本：
 
 ```
-https://github.com/Enterpr1se/seedbridge/releases/download/v1.0.0/seedbridge.tar.gz
+https://github.com/Enterpr1se/seedbridge/releases/download/v1.0.9/seedbridge.tar.gz
 ```
 
 1. Container Station → **映像檔** → **匯入**。
@@ -69,7 +69,7 @@ Repo 要保持 **Public**。私人 repo 的下載網址要登入，Container Sta
 
 監控目錄留空就處理全部已對應路徑。多個目錄用 `;` 隔開，例如 `/115/Video/Movie;/115/Video/TV`。目錄以外的 CloudDrive 改名會直接忽略，不會寫進改名紀錄。
 
-填 Telegram Bot Token 同 Chat ID 之後，改名成功會發「成功改名」，並附上新資料夾裡的 poster（`poster.jpg`、`folder.jpg`、`cover.jpg` 或 png）。磁碟沒有圖、但路徑有 `[tmdbid=]` 而且填了 TMDB API Key 時，才會向 TMDB 取海報。失敗只發路徑同檔案名，不會附評分、類型或劇情。
+填 Telegram Bot Token 同 Chat ID 之後，每個種子只發一則 Telegram。成功時標題係「已成功改名」，並寫成功同失敗數量。失敗檔案不多於 10 個會列出路徑；多過 10 個就只報數量，請去 SeedBridge 紀錄查看。有成功時附上新資料夾裡的 poster（`poster.jpg`、`folder.jpg`、`cover.jpg` 或 png），優先用第一個成功檔所在資料夾。磁碟沒有圖、但路徑有 `[tmdbid=]` 而且填了 TMDB API Key 時，才會向 TMDB 取海報。失敗內容只留路徑同檔案名，不會附評分、類型或劇情。監控目錄以外、同沒有需要改名的工作，不會發 Telegram。
 
 建議第一次：
 
@@ -109,7 +109,7 @@ ghcr.io/enterpr1se/seedbridge:latest
 **匯入檔：** 用上面同一條 latest URL 再下載，再匯入。映像檔名稱係 `seedbridge:latest`。如果 Container Station 話格式不支援，改匯入這個傳統格式：
 
 ```
-https://github.com/Enterpr1se/seedbridge/releases/download/v1.0.0/seedbridge-1.0.0.tar.gz
+https://github.com/Enterpr1se/seedbridge/releases/download/v1.0.9/seedbridge.tar.gz
 ```
 
 兩個做法都一樣：停掉舊容器，唔好刪 `/data`，新容器掛返同一個 `/data` 同 `/media`，IP 用返同一個。打開網頁，帳號同設定會在。

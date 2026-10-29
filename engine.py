@@ -975,7 +975,8 @@ class Engine:
                     self._process(batch)
                 except Exception as exc:  # noqa: BLE001
                     self.last_report = f"處理失敗：{exc}"
-                    db.add_activity("error", self.last_report, announce=True)
+                    db.add_activity("error", self.last_report)
+                    self._announce_job("", [], [{"detail": self.last_report}], self.last_report)
                     self.log(self.last_report)
 
     def _process(self, batch: list[dict]) -> None:
@@ -1014,8 +1015,12 @@ class Engine:
         claimed: dict[str, str] = {}
         ambiguous: set[str] = set()
         plans_by_hash: dict[str, dict] = {}
+        planning_errors: dict[str, list[dict]] = {}
+        planning_names: dict[str, str] = {}
         for tor, host_save in candidates:
             infohash = tor["hash"]
+            torrent_name = tor.get("name") or ""
+            planning_names[infohash] = torrent_name
             files = client.files(infohash)
             plans = []
             for item in files:
@@ -1028,10 +1033,12 @@ class Engine:
                     db.add_activity(
                         "error",
                         "同一個檔有多於一個可能的新路徑，已跳過",
-                        tor.get("name") or "",
+                        torrent_name,
                         host_file,
                         "",
-                        announce=True,
+                    )
+                    planning_errors.setdefault(infohash, []).append(
+                        {"path": host_file, "old": rel, "new": ""}
                     )
                     continue
                 if new_host == host_file:
@@ -1067,14 +1074,32 @@ class Engine:
         if not plans_by_hash:
             self.last_report = "路徑對得上儲存目錄，但沒有種子檔需要改名"
             db.add_activity("skip", self.last_report)
+            self._announce_unplanned(planning_errors, planning_names, set(), dry)
             return
 
         done = 0
+        handled: set[str] = set()
         for infohash, bag in plans_by_hash.items():
-            plans = [plan for plan in bag["plans"] if plan["host_old"] not in ambiguous]
-            if not plans:
-                continue
+            handled.add(infohash)
             name = bag["torrent"].get("name") or infohash[:8]
+            extra = list(planning_errors.get(infohash) or [])
+            plans = []
+            for plan in bag["plans"]:
+                if plan["host_old"] in ambiguous:
+                    extra.append(self._job_item(plan))
+                    db.add_activity(
+                        "error",
+                        "同一個檔有多於一個可能的新路徑，已跳過",
+                        name,
+                        plan["old_rel"],
+                        plan["new_rel"],
+                    )
+                    continue
+                plans.append(plan)
+            if not plans:
+                if extra and not dry:
+                    self._announce_job(name, [], extra, "同一個檔有多於一個可能的新路徑，已跳過")
+                continue
             if dry:
                 for plan in plans:
                     db.add_activity("skip", "只記錄，未改 qBittorrent", name, plan["old_rel"], plan["new_rel"])
@@ -1090,6 +1115,7 @@ class Engine:
                     bag["files"],
                     bag["host_save"],
                     resume=state not in USER_PAUSED,
+                    failed=extra,
                 )
                 done += len(plans)
             except Exception as exc:  # noqa: BLE001
@@ -1101,11 +1127,54 @@ class Engine:
                     plans[0]["old_rel"],
                     plans[0]["new_rel"],
                     blob,
-                    announce=True,
                 )
+                failed = extra + [self._job_item(plan) for plan in plans]
+                self._announce_job(name, [], failed, str(exc))
                 self.log(f"{infohash[:8]} {exc}")
+        self._announce_unplanned(planning_errors, planning_names, handled, dry)
         self.last_report = f"{'已記錄' if dry else '已自動對齊'} {done} 個路徑"
         self.log(self.last_report)
+
+    def _job_item(self, plan: dict) -> dict:
+        old = str(plan.get("host_old") or plan.get("old_rel") or "")
+        new = str(plan.get("host_new") or plan.get("new_rel") or "")
+        if old and new and old != new:
+            shown = f"{old} → {new}"
+        else:
+            shown = old or new
+        return {
+            "path": shown,
+            "old": str(plan.get("old_rel") or old),
+            "new": str(plan.get("new_rel") or new),
+            "poster_dir": os.path.dirname(str(plan.get("host_new") or "")),
+        }
+
+    def _announce_job(self, name: str, ok: list | None = None, failed: list | None = None, detail: str = "") -> None:
+        try:
+            import notify
+
+            notify.schedule_job(torrent=name or "", ok=ok or [], failed=failed or [], detail=detail or "")
+        except Exception:
+            pass
+
+    def _announce_unplanned(
+        self,
+        errors: dict[str, list],
+        names: dict[str, str],
+        handled: set[str],
+        dry: bool,
+    ) -> None:
+        if dry:
+            return
+        for infohash, failed in errors.items():
+            if infohash in handled or not failed:
+                continue
+            self._announce_job(
+                names.get(infohash) or infohash[:8],
+                [],
+                failed,
+                "同一個檔有多於一個可能的新路徑，已跳過",
+            )
 
     def _apply(
         self,
@@ -1116,6 +1185,7 @@ class Engine:
         files: list[dict],
         host_save: str,
         resume: bool,
+        failed: list | None = None,
     ) -> None:
         olds = {plan["host_old"] for plan in plans}
         news = {plan["host_new"] for plan in plans}
@@ -1135,6 +1205,7 @@ class Engine:
             self.log(f"pause skipped: {exc}")
         try:
             execute_plans(client, infohash, plans, host_save, log=self.log, resume=resume)
+            ok_items = []
             for plan in plans:
                 db.add_activity(
                     "ok",
@@ -1142,9 +1213,10 @@ class Engine:
                     name,
                     plan["old_rel"],
                     plan["new_rel"],
-                    announce=True,
-                    poster_dir=os.path.dirname(plan["host_new"]),
                 )
+                ok_items.append(self._job_item(plan))
+            detail = "同一個檔有多於一個可能的新路徑，已跳過" if failed else ""
+            self._announce_job(name, ok_items, failed or [], detail)
             if db.get_settings().get("rename_torrent_title"):
                 all_rels = [str(item.get("name") or "") for item in files]
                 self._touch_display_name(client, infohash, plans, all_rels)
@@ -1194,6 +1266,7 @@ class Engine:
                 self.log(f"pause skipped: {exc}")
             try:
                 execute_plans(client, infohash, plans, host_save, log=self.log, resume=resume)
+                ok_items = []
                 for plan in plans:
                     db.add_activity(
                         "ok",
@@ -1201,9 +1274,9 @@ class Engine:
                         name,
                         plan["old_rel"],
                         plan["new_rel"],
-                        announce=True,
-                        poster_dir=os.path.dirname(plan.get("host_new") or ""),
                     )
+                    ok_items.append(self._job_item(plan))
+                self._announce_job(name, ok_items, [])
             except Exception as exc:  # noqa: BLE001
                 blob = getattr(exc, "retry", "") or raw
                 db.add_activity(
@@ -1213,8 +1286,8 @@ class Engine:
                     plans[0]["old_rel"],
                     plans[0]["new_rel"],
                     blob,
-                    announce=True,
                 )
+                self._announce_job(name, [], [self._job_item(plan) for plan in plans], str(exc))
                 self.log(f"retry {infohash[:8]} {exc}")
             finally:
                 if resume:
@@ -1259,12 +1332,13 @@ def self_test() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         os.makedirs(os.path.join(tmp, "B"))
         open(os.path.join(tmp, "B", "new.mkv"), "w").close()
+        root = norm_path(tmp)
         ev = [
-            {"src": f"{tmp}/A/old.mkv", "dst": f"{tmp}/A/new.mkv", "is_dir": False},
-            {"src": f"{tmp}/A", "dst": f"{tmp}/B", "is_dir": True},
+            {"src": f"{root}/A/old.mkv", "dst": f"{root}/A/new.mkv", "is_dir": False},
+            {"src": f"{root}/A", "dst": f"{root}/B", "is_dir": True},
         ]
-        chosen = choose_new_host(f"{tmp}/A/old.mkv", list(reversed(ev)))
-        assert chosen == f"{tmp}/B/new.mkv", chosen
+        chosen = choose_new_host(f"{root}/A/old.mkv", list(reversed(ev)))
+        assert chosen == f"{root}/B/new.mkv", chosen
     plans = [
         {"old_rel": "Old/a.mkv", "new_rel": "New/a.mkv"},
         {"old_rel": "Old/b.mkv", "new_rel": "New/b.mkv"},
