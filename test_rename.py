@@ -815,6 +815,68 @@ def test_choose_new_host_finds_season_layer():
         assert chosen == f"{root}/{FALLOUT_SHOW}/{filename}", chosen
 
 
+ROOT_ISO = "abc.iso"
+ROOT_WRAP = "abc/abc.iso"
+ROOT_NEW = "abc [tmdbid=123]/abc [tmdbid=123].iso"
+
+
+def test_root_file_wrap_then_filmix():
+    """A torrent root file wrapped as stem/filename, then renamed by Filmix."""
+    plans = [{"old_rel": "/abc.iso", "new_rel": ROOT_NEW}]
+    ops = engine.stage_ops(plans)
+    assert ops == [{"kind": "file", "old": ROOT_ISO, "new": ROOT_NEW}]
+    wrapped_plans = [{"old_rel": ROOT_WRAP, "new_rel": ROOT_NEW}]
+    wrapped_ops = engine.stage_ops(wrapped_plans)
+    assert [item["kind"] for item in wrapped_ops] == ["file", "file"]
+    assert wrapped_ops[0]["old"] == ROOT_WRAP
+    assert wrapped_ops[0]["new"] == "abc/abc [tmdbid=123].iso"
+    assert wrapped_ops[1]["old"] == wrapped_ops[0]["new"]
+    assert wrapped_ops[1]["new"] == ROOT_NEW
+    assert "Season" not in ops[0]["new"]
+    with tempfile.TemporaryDirectory() as tmp:
+        root = engine.norm_path(tmp)
+        new_host = f"{root}/{ROOT_NEW}"
+        _write(new_host, "iso")
+        events = [
+            {"src": f"{root}/abc/abc.iso", "dst": f"{root}/abc/abc [tmdbid=123].iso", "is_dir": False},
+            {"src": f"{root}/abc", "dst": f"{root}/abc [tmdbid=123]", "is_dir": True},
+        ]
+        assert engine.choose_new_host(f"{root}/abc.iso", events) == f"{root}/abc.iso"
+        chosen = engine.choose_content_host(f"{root}/abc.iso", events, root=True)
+        assert chosen == new_host, chosen
+        assert engine.choose_content_host(f"{root}/Other/abc.iso", events, root=False) == f"{root}/Other/abc.iso"
+        direct = [
+            {"src": f"{root}/abc.iso", "dst": new_host, "is_dir": False},
+        ]
+        assert engine.choose_content_host(f"{root}/abc.iso", direct, root=True) == new_host
+        plans = _rel_plans(tmp, ROOT_ISO, ROOT_NEW)
+        client = DiskSyncQbit([ROOT_ISO], tmp)
+        _run(client, plans, tmp)
+        assert client.names == [ROOT_NEW]
+        assert client.calls == [("file", ROOT_ISO, ROOT_NEW)]
+        assert open(plans[0]["host_new"], encoding="utf-8").read() == "iso"
+        assert not os.path.exists(os.path.join(tmp, ROOT_ISO))
+    with tempfile.TemporaryDirectory() as tmp:
+        _write(os.path.join(tmp, ROOT_WRAP), "iso")
+        plans = _rel_plans(tmp, ROOT_ISO, ROOT_NEW)
+        client = DiskSyncQbit([ROOT_ISO], tmp)
+        _run(client, plans, tmp)
+        assert client.names == [ROOT_NEW]
+        assert open(plans[0]["host_new"], encoding="utf-8").read() == "iso"
+        assert not os.path.exists(os.path.join(tmp, ROOT_WRAP))
+        assert not os.path.exists(os.path.join(tmp, ROOT_ISO))
+    with tempfile.TemporaryDirectory() as tmp:
+        _write(os.path.join(tmp, ROOT_WRAP), "iso")
+        plans = _rel_plans(tmp, ROOT_WRAP, ROOT_NEW)
+        client = DiskSyncQbit([ROOT_WRAP], tmp)
+        _run(client, plans, tmp)
+        assert client.names == [ROOT_NEW]
+        assert [kind for kind, _old, _new in client.calls] == ["file", "file"]
+        assert client.calls[-1][2] == ROOT_NEW
+        assert open(plans[0]["host_new"], encoding="utf-8").read() == "iso"
+        assert not os.path.exists(os.path.join(tmp, ROOT_ISO))
+
+
 def test_only_missing_files_do_not_raise():
     with tempfile.TemporaryDirectory() as tmp:
         old_rel = "Old/skip.jpg"
@@ -857,6 +919,7 @@ if __name__ == "__main__":
     test_collapsing_client_keeps_full_season_path()
     test_rematch_collapsed_season_path()
     test_choose_new_host_finds_season_layer()
+    test_root_file_wrap_then_filmix()
     test_only_missing_files_do_not_raise()
     engine.self_test()
     print("test_rename ok")

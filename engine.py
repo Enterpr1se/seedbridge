@@ -176,6 +176,75 @@ def choose_new_host(host_file: str, events: list[dict]) -> str | None:
     return variants[0]
 
 
+def _file_stem(name: str) -> str:
+    """qB content-layout subfolder: the file name with its last extension removed."""
+    base = os.path.basename(name)
+    if not base or base.startswith("."):
+        return ""
+    stem, dot, ext = base.rpartition(".")
+    if not dot or not ext or not stem:
+        return base
+    return stem
+
+
+def _root_rel(rel: str) -> bool:
+    rel = norm_path(rel).lstrip("/")
+    return bool(rel) and "/" not in rel
+
+
+def _wrapped_root_rel(rel: str) -> str | None:
+    """Owner/qB wrap of a root file: abc.iso -> abc/abc.iso."""
+    rel = norm_path(rel).lstrip("/")
+    if not _root_rel(rel):
+        return None
+    stem = _file_stem(rel)
+    if not stem:
+        return None
+    return norm_path(stem + "/" + rel)
+
+
+def _wrap_candidates(host_file: str, events: list[dict]) -> list[str]:
+    host_file = norm_path(host_file)
+    parent = norm_path(os.path.dirname(host_file))
+    name = os.path.basename(host_file)
+    if not parent or not name:
+        return []
+    found: list[str] = []
+    wrapped = _wrapped_root_rel(name)
+    if wrapped:
+        found.append(norm_path(parent + "/" + wrapped))
+    for event in events:
+        for key in ("src", "dst"):
+            path = norm_path(str(event.get(key) or ""))
+            if not path or os.path.basename(path) != name or path == host_file:
+                continue
+            folder = norm_path(os.path.dirname(path))
+            if norm_path(os.path.dirname(folder)) != parent:
+                continue
+            if path not in found:
+                found.append(path)
+    return found
+
+
+def choose_content_host(host_file: str, events: list[dict], *, root: bool = False) -> str | None:
+    """choose_new_host, plus a root file that was wrapped into stem/filename before Filmix."""
+    chosen = choose_new_host(host_file, events)
+    if chosen != host_file or not root:
+        return chosen
+    alts: list[str] = []
+    for wrapped in _wrap_candidates(host_file, events):
+        alt = choose_new_host(wrapped, events)
+        if alt is None:
+            return None
+        if alt != wrapped and alt not in alts:
+            alts.append(alt)
+    if len(alts) > 1:
+        return None
+    if len(alts) == 1:
+        return alts[0]
+    return host_file
+
+
 def _map_prefix(path: str, maps: list[dict], src_key: str, dst_key: str) -> str | None:
     path = norm_path(path)
     ordered = sorted(maps, key=lambda item: len(norm_path(item.get(src_key) or "")), reverse=True)
@@ -465,15 +534,33 @@ def _extra_layer_chain(old_rel: str, new_rel: str) -> list[str]:
     return _dedupe_hops(hops)
 
 
+def _root_file_chain(old_rel: str, new_rel: str) -> list[str]:
+    """Put a root file into the new folder, then add any deeper directories one at a time."""
+    new_segs = _segs(new_rel)
+    if len(new_segs) < 2:
+        return _dedupe_hops([old_rel, new_rel])
+    new_root = new_segs[0]
+    new_name = new_segs[-1]
+    hops = [norm_path(old_rel).lstrip("/"), "/".join([new_root, new_name])]
+    current = [new_root, new_name]
+    for part in new_segs[1:-1]:
+        current = [*current[:-1], part, current[-1]]
+        hops.append("/".join(current))
+    hops.append("/".join(new_segs))
+    return _dedupe_hops(hops)
+
+
 def plan_hops(old_rel: str, new_rel: str) -> list[str]:
     """Old, intermediate, and final relative paths for one torrent file."""
-    old_rel = norm_path(old_rel) if old_rel else ""
-    new_rel = norm_path(new_rel) if new_rel else ""
+    old_rel = norm_path(old_rel).lstrip("/") if old_rel else ""
+    new_rel = norm_path(new_rel).lstrip("/") if new_rel else ""
     if not old_rel and not new_rel:
         return []
     old_segs = _segs(old_rel)
     new_segs = _segs(new_rel)
-    if len(old_segs) >= 2 and len(new_segs) >= 2 and len(new_segs) > len(old_segs):
+    if old_segs and len(new_segs) >= 2 and len(new_segs) > len(old_segs):
+        if len(old_segs) == 1:
+            return _root_file_chain(old_rel, new_rel)
         return _extra_layer_chain(old_rel, new_rel)
     hops: list[str] = []
     if old_rel:
@@ -519,6 +606,25 @@ def _collapsed_rel(new_rel: str, names: set[str]) -> str | None:
             best = norm_path(name)
             best_len = len(segs)
     return best or None
+
+
+def _root_reverted_name(plan: dict, names: set[str]) -> str | None:
+    """qB path collapsed back to a root file while the bytes live in a folder."""
+    new_segs = _segs(plan.get("new_rel") or "")
+    old_segs = _segs(plan.get("old_rel") or "")
+    if len(new_segs) < 2 or not old_segs:
+        return None
+    wanted = {old_segs[-1], new_segs[-1]}
+    hits: list[str] = []
+    for name in names:
+        segs = _segs(name)
+        if len(segs) == 1 and segs[0] in wanted:
+            cleaned = norm_path(name).lstrip("/")
+            if cleaned not in hits:
+                hits.append(cleaned)
+    if len(hits) == 1:
+        return hits[0]
+    return None
 
 
 def _uncollapse_ops(collapsed: str, full: str) -> list[tuple[str, str]]:
@@ -663,8 +769,16 @@ def _disk_for(host_save: str, rel: str) -> str:
     return norm_path(host_save.rstrip("/") + "/" + rel.lstrip("/"))
 
 
+def _location_rels(old_rel: str, new_rel: str) -> list[str]:
+    rels = list(plan_hops(old_rel, new_rel))
+    wrapped = _wrapped_root_rel(old_rel)
+    if wrapped and norm_path(wrapped) not in {norm_path(item) for item in rels}:
+        rels.append(wrapped)
+    return rels
+
+
 def _candidate_disks(plan: dict, host_save: str) -> list[str]:
-    paths = [_disk_for(host_save, rel) for rel in plan_hops(plan["old_rel"], plan["new_rel"])]
+    paths = [_disk_for(host_save, rel) for rel in _location_rels(plan["old_rel"], plan["new_rel"])]
     paths.append(plan["host_old"])
     paths.append(plan["host_new"])
     unique: list[str] = []
@@ -695,12 +809,15 @@ def _qbit_rel(plan: dict, names: set[str]) -> str:
     collapsed = _collapsed_rel(plan.get("new_rel") or "", names)
     if collapsed:
         return collapsed
+    reverted = _root_reverted_name(plan, names)
+    if reverted:
+        return reverted
     return plan.get("old_rel") or ""
 
 
 def plan_has_bytes(plan: dict, host_save: str) -> bool:
-    """True when this torrent file has bytes at an old, hop, or Filmix path."""
-    paths = [_disk_for(host_save, hop) for hop in plan_hops(plan.get("old_rel") or "", plan.get("new_rel") or "")]
+    """True when this torrent file has bytes at an old, hop, wrapped, or Filmix path."""
+    paths = [_disk_for(host_save, hop) for hop in _location_rels(plan.get("old_rel") or "", plan.get("new_rel") or "")]
     paths.append(plan.get("host_old") or "")
     paths.append(plan.get("host_new") or "")
     return any(path and os.path.lexists(path) for path in paths)
@@ -805,6 +922,9 @@ def _file_sources(op: dict, plans: list[dict], host_save: str) -> list[str]:
                 continue
             mids.append(_disk_for(host_save, hop))
         olds.append(_disk_for(host_save, plan["old_rel"]))
+        wrapped = _wrapped_root_rel(plan["old_rel"])
+        if wrapped:
+            olds.append(_disk_for(host_save, wrapped))
         if plan.get("host_old"):
             olds.append(plan["host_old"])
         host_new = plan.get("host_new") or ""
@@ -817,7 +937,7 @@ def _plan_file_sources(plan: dict, host_save: str, current_rel: str) -> list[str
     sources = []
     if current_rel:
         sources.append(_disk_for(host_save, current_rel))
-    for hop in plan_hops(plan["old_rel"], plan["new_rel"]):
+    for hop in _location_rels(plan["old_rel"], plan["new_rel"]):
         sources.append(_disk_for(host_save, hop))
     if plan.get("host_old"):
         sources.append(plan["host_old"])
@@ -835,6 +955,11 @@ def _plan_suppress_pairs(plan: dict, host_save: str) -> list[tuple[str, str]]:
     disks: list[str] = []
     for hop in plan_hops(plan.get("old_rel") or "", plan.get("new_rel") or ""):
         disk = _disk_for(host_save, hop)
+        if disk and disk not in disks:
+            disks.append(disk)
+    wrapped = _wrapped_root_rel(plan.get("old_rel") or "")
+    if wrapped:
+        disk = _disk_for(host_save, wrapped)
         if disk and disk not in disks:
             disks.append(disk)
     for disk in disks:
@@ -976,22 +1101,25 @@ def _repair_collapsed(client, infohash: str, plans: list[dict], host_save: str, 
             return
         _ensure_disk_at(host_save, _plan_file_sources(plan, host_save, old), new)
 
-    def rename(plan: dict, old: str, new: str) -> None:
-        if norm_path(old) == norm_path(new):
+    def rename(plan: dict, old: str, new: str, label: str) -> None:
+        if norm_path(old).lstrip("/") == norm_path(new).lstrip("/"):
             return
-        say(f"季資料夾路徑對回 {old} → {new}")
+        say(f"{label} {old} → {new}")
         place(plan, old, new)
         client.rename_file(infohash, old, new)
 
     for plan in plans:
         full = norm_path(plan["new_rel"])
         names = _names_of(fetch())
-        if full in names:
+        if full in names or norm_path(full).lstrip("/") in names:
             continue
         collapsed = _collapsed_rel(full, names)
         if not collapsed:
+            reverted = _root_reverted_name(plan, names)
+            if reverted:
+                rename(plan, reverted, plan["new_rel"], "根目錄檔對回")
             continue
-        rename(plan, collapsed, plan["new_rel"])
+        rename(plan, collapsed, plan["new_rel"], "季資料夾路徑對回")
         names = _names_of(fetch())
         if full in names:
             continue
@@ -1002,7 +1130,7 @@ def _repair_collapsed(client, infohash: str, plans: list[dict], host_save: str, 
                 break
             if norm_path(old) not in names:
                 continue
-            rename(plan, old, new)
+            rename(plan, old, new, "季資料夾路徑對回")
 
 
 def execute_plans(
@@ -1299,7 +1427,7 @@ class Engine:
                 if not rel:
                     continue
                 host_file = norm_path(host_save + "/" + rel)
-                new_host = choose_new_host(host_file, batch)
+                new_host = choose_content_host(host_file, batch, root=_root_rel(rel))
                 if new_host is None:
                     db.add_activity(
                         "error",
@@ -1642,6 +1770,11 @@ def self_test() -> None:
     assert _collapsed_rel(fallout_season, {"Season 2/" + fallout_season.split("/")[-1]}) == (
         "Season 2/" + fallout_season.split("/")[-1]
     )
+    root_new = "abc [tmdbid=123]/abc [tmdbid=123].iso"
+    root_ops = stage_ops([{"old_rel": "/abc.iso", "new_rel": root_new}])
+    assert root_ops == [{"kind": "file", "old": "abc.iso", "new": root_new}], root_ops
+    assert _wrapped_root_rel("abc.iso") == "abc/abc.iso"
+    assert _wrapped_root_rel("abc/abc.iso") is None
     print("self-test ok")
 
 
