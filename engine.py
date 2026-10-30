@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import threading
 import time
@@ -30,6 +31,12 @@ DL_STATES = {
 }
 USER_PAUSED = {"pausedUP", "pausedDL", "stoppedUP", "stoppedDL"}
 SKIP_PARTS = (".!qb", ".parts", ".temp")
+# Filmix / Emby season directories inserted between the show folder and the episode.
+_SEASON_DIR_RE = re.compile(
+    r"^(?:season[\s._-]*\d+|s\d{1,2}|specials|第\s*\d+\s*季)$",
+    re.IGNORECASE,
+)
+_EPISODE_RE = re.compile(r"S(\d{1,2})E(\d{1,3})", re.IGNORECASE)
 
 
 def nfc(value: str) -> str:
@@ -98,6 +105,56 @@ def chain_variants(path: str, events: list[dict]) -> list[str]:
     return seen
 
 
+def _existing_season_variants(path: str) -> list[str]:
+    """On-disk Season folder under the chain parent or its parent. Missing dirs are ignored."""
+    path = norm_path(path)
+    parent = os.path.dirname(path)
+    name = os.path.basename(path)
+    if not parent or not name:
+        return []
+    bases = [parent]
+    grand = os.path.dirname(parent)
+    if grand and grand != parent:
+        bases.append(grand)
+    hits: list[str] = []
+    seen_dirs: set[str] = set()
+    for base in bases:
+        base = norm_path(base)
+        if not base or base in seen_dirs or not os.path.isdir(base):
+            continue
+        seen_dirs.add(base)
+        try:
+            entries = os.listdir(base)
+        except OSError:
+            continue
+        for entry in entries:
+            if not _is_season_dir(entry):
+                continue
+            season_dir = norm_path(base + "/" + entry)
+            direct = norm_path(season_dir + "/" + name)
+            if os.path.lexists(direct):
+                if direct not in hits:
+                    hits.append(direct)
+                continue
+            token = _episode_token(name)
+            if not token or not os.path.isdir(season_dir):
+                continue
+            try:
+                children = os.listdir(season_dir)
+            except OSError:
+                continue
+            matched: list[str] = []
+            for child in children:
+                child_path = norm_path(season_dir + "/" + child)
+                if not os.path.isfile(child_path) or not _interesting(child_path):
+                    continue
+                if _episode_token(child) == token:
+                    matched.append(child_path)
+            if len(matched) == 1 and matched[0] not in hits:
+                hits.append(matched[0])
+    return hits
+
+
 def choose_new_host(host_file: str, events: list[dict]) -> str | None:
     variants = [item for item in chain_variants(host_file, events) if item != host_file]
     if not variants:
@@ -107,7 +164,85 @@ def choose_new_host(host_file: str, events: list[dict]) -> str | None:
         return None
     if len(existing) == 1:
         return existing[0]
+    season_hits: list[str] = []
+    for variant in variants:
+        for hit in _existing_season_variants(variant):
+            if hit not in season_hits:
+                season_hits.append(hit)
+    if len(season_hits) > 1:
+        return None
+    if len(season_hits) == 1:
+        return season_hits[0]
     return variants[0]
+
+
+def _file_stem(name: str) -> str:
+    """qB content-layout subfolder: the file name with its last extension removed."""
+    base = os.path.basename(name)
+    if not base or base.startswith("."):
+        return ""
+    stem, dot, ext = base.rpartition(".")
+    if not dot or not ext or not stem:
+        return base
+    return stem
+
+
+def _root_rel(rel: str) -> bool:
+    rel = norm_path(rel).lstrip("/")
+    return bool(rel) and "/" not in rel
+
+
+def _wrapped_root_rel(rel: str) -> str | None:
+    """Owner/qB wrap of a root file: abc.iso -> abc/abc.iso."""
+    rel = norm_path(rel).lstrip("/")
+    if not _root_rel(rel):
+        return None
+    stem = _file_stem(rel)
+    if not stem:
+        return None
+    return norm_path(stem + "/" + rel)
+
+
+def _wrap_candidates(host_file: str, events: list[dict]) -> list[str]:
+    host_file = norm_path(host_file)
+    parent = norm_path(os.path.dirname(host_file))
+    name = os.path.basename(host_file)
+    if not parent or not name:
+        return []
+    found: list[str] = []
+    wrapped = _wrapped_root_rel(name)
+    if wrapped:
+        found.append(norm_path(parent + "/" + wrapped))
+    for event in events:
+        for key in ("src", "dst"):
+            path = norm_path(str(event.get(key) or ""))
+            if not path or os.path.basename(path) != name or path == host_file:
+                continue
+            folder = norm_path(os.path.dirname(path))
+            if norm_path(os.path.dirname(folder)) != parent:
+                continue
+            if path not in found:
+                found.append(path)
+    return found
+
+
+def choose_content_host(host_file: str, events: list[dict], *, root: bool = False) -> str | None:
+    """choose_new_host, plus a root file that was wrapped into stem/filename before Filmix."""
+    chosen = choose_new_host(host_file, events)
+    if chosen != host_file or not root:
+        return chosen
+    alts: list[str] = []
+    for wrapped in _wrap_candidates(host_file, events):
+        alt = choose_new_host(wrapped, events)
+        if alt is None:
+            return None
+        if alt != wrapped and alt not in alts:
+            alts.append(alt)
+    if len(alts) > 1:
+        return None
+    if len(alts) == 1:
+        return alts[0]
+    return host_file
 
 
 def _map_prefix(path: str, maps: list[dict], src_key: str, dst_key: str) -> str | None:
@@ -348,6 +483,175 @@ def intermediate_rel(old_rel: str, new_rel: str) -> str | None:
     return old_parent + "/" + new_rest
 
 
+def _segs(rel: str) -> list[str]:
+    return [part for part in norm_path(rel).split("/") if part]
+
+
+def _is_season_dir(name: str) -> bool:
+    return bool(_SEASON_DIR_RE.match(name))
+
+
+def _episode_token(name: str) -> str | None:
+    match = _EPISODE_RE.search(name)
+    if not match:
+        return None
+    return f"S{int(match.group(1)):02d}E{int(match.group(2)):02d}"
+
+
+def _dedupe_hops(hops: list[str]) -> list[str]:
+    unique: list[str] = []
+    for hop in hops:
+        hop = norm_path(hop)
+        if not hop or (unique and unique[-1] == hop):
+            continue
+        unique.append(hop)
+    return unique
+
+
+def _extra_layer_chain(old_rel: str, new_rel: str) -> list[str]:
+    """Insert each extra directory under the old root, then rename the root.
+
+    One qBittorrent rename must not both change the first folder and add a
+    directory. That pair collapses to the last directory only (Season N/file).
+    """
+    old_segs = _segs(old_rel)
+    new_segs = _segs(new_rel)
+    if len(old_segs) < 2 or len(new_segs) < 2 or len(new_segs) <= len(old_segs):
+        return _dedupe_hops([old_rel, new_rel])
+    old_root = old_segs[0]
+    new_name = new_segs[-1]
+    old_middle = old_segs[1:-1]
+    new_middle = new_segs[1:-1]
+    hops = ["/".join(old_segs), "/".join(old_segs[:-1] + [new_name])]
+    if new_middle[: len(old_middle)] == old_middle:
+        current = [old_root, *old_middle, new_name]
+        for part in new_middle[len(old_middle) :]:
+            current = [*current[:-1], part, current[-1]]
+            hops.append("/".join(current))
+    else:
+        hops.append("/".join([old_root, *new_middle, new_name]))
+    hops.append("/".join(new_segs))
+    return _dedupe_hops(hops)
+
+
+def _root_file_chain(old_rel: str, new_rel: str) -> list[str]:
+    """Put a root file into the new folder, then add any deeper directories one at a time."""
+    new_segs = _segs(new_rel)
+    if len(new_segs) < 2:
+        return _dedupe_hops([old_rel, new_rel])
+    new_root = new_segs[0]
+    new_name = new_segs[-1]
+    hops = [norm_path(old_rel).lstrip("/"), "/".join([new_root, new_name])]
+    current = [new_root, new_name]
+    for part in new_segs[1:-1]:
+        current = [*current[:-1], part, current[-1]]
+        hops.append("/".join(current))
+    hops.append("/".join(new_segs))
+    return _dedupe_hops(hops)
+
+
+def plan_hops(old_rel: str, new_rel: str) -> list[str]:
+    """Old, intermediate, and final relative paths for one torrent file."""
+    old_rel = norm_path(old_rel).lstrip("/") if old_rel else ""
+    new_rel = norm_path(new_rel).lstrip("/") if new_rel else ""
+    if not old_rel and not new_rel:
+        return []
+    old_segs = _segs(old_rel)
+    new_segs = _segs(new_rel)
+    if old_segs and len(new_segs) >= 2 and len(new_segs) > len(old_segs):
+        if len(old_segs) == 1:
+            return _root_file_chain(old_rel, new_rel)
+        return _extra_layer_chain(old_rel, new_rel)
+    hops: list[str] = []
+    if old_rel:
+        hops.append(old_rel)
+    if old_rel and new_rel:
+        mid = intermediate_rel(old_rel, new_rel)
+        if mid and (not hops or hops[-1] != norm_path(mid)):
+            hops.append(norm_path(mid))
+    if new_rel and (not hops or hops[-1] != new_rel):
+        hops.append(new_rel)
+    return hops
+
+
+def _stage_extra_layers(plans: list[dict]) -> list[dict]:
+    chains = [plan_hops(plan["old_rel"], plan["new_rel"]) for plan in plans]
+    width = max((len(chain) - 1 for chain in chains), default=0)
+    ops = []
+    for step in range(width):
+        for chain in chains:
+            if step + 1 >= len(chain):
+                continue
+            old, new = chain[step], chain[step + 1]
+            if norm_path(old) == norm_path(new):
+                continue
+            ops.append({"kind": "file", "old": old, "new": new})
+    return ops
+
+
+def _collapsed_rel(new_rel: str, names: set[str]) -> str | None:
+    """Longest qB name that is a strict season suffix of the full relative path."""
+    full = _segs(new_rel)
+    if len(full) < 3:
+        return None
+    best = ""
+    best_len = 0
+    for name in names:
+        segs = _segs(name)
+        if len(segs) < 2 or len(segs) >= len(full) or full[-len(segs) :] != segs:
+            continue
+        if not any(_is_season_dir(part) for part in segs[:-1]):
+            continue
+        if len(segs) > best_len:
+            best = norm_path(name)
+            best_len = len(segs)
+    return best or None
+
+
+def _root_reverted_name(plan: dict, names: set[str]) -> str | None:
+    """qB path collapsed back to a root file while the bytes live in a folder."""
+    new_segs = _segs(plan.get("new_rel") or "")
+    old_segs = _segs(plan.get("old_rel") or "")
+    if len(new_segs) < 2 or not old_segs:
+        return None
+    wanted = {old_segs[-1], new_segs[-1]}
+    hits: list[str] = []
+    for name in names:
+        segs = _segs(name)
+        if len(segs) == 1 and segs[0] in wanted:
+            cleaned = norm_path(name).lstrip("/")
+            if cleaned not in hits:
+                hits.append(cleaned)
+    if len(hits) == 1:
+        return hits[0]
+    return None
+
+
+def _uncollapse_ops(collapsed: str, full: str) -> list[tuple[str, str]]:
+    """Same-depth root rename, then insert each middle directory one at a time."""
+    collapsed_segs = _segs(collapsed)
+    full_segs = _segs(full)
+    direct = (norm_path(collapsed), norm_path(full))
+    if (
+        len(collapsed_segs) < 2
+        or len(full_segs) <= len(collapsed_segs)
+        or full_segs[-len(collapsed_segs) :] != collapsed_segs
+    ):
+        return [direct]
+    dropped = full_segs[: -len(collapsed_segs)]
+    if not dropped or _is_season_dir(dropped[0]):
+        return [direct]
+    show = dropped[0]
+    filename = full_segs[-1]
+    current = [show, filename]
+    ops = [(norm_path(collapsed), "/".join(current))]
+    for index, _part in enumerate(full_segs[1:-1]):
+        nxt = [show, *full_segs[1 : index + 2], filename]
+        ops.append(("/".join(current), "/".join(nxt)))
+        current = nxt
+    return ops
+
+
 def stage_ops(plans: list[dict]) -> list[dict]:
     """Split a folder+file rename into qBittorrent steps.
 
@@ -357,10 +661,14 @@ def stage_ops(plans: list[dict]) -> list[dict]:
     directory, and leave torrent file paths unchanged.
     Same-filename trees (parent only) still use one renameFolder, with a
     per-file renameFile fallback in execute_plans.
+    A new Season (or any extra) directory is inserted one level at a time
+    before the root folder is renamed, so one call never does both.
     """
     usable = [plan for plan in plans if norm_path(plan["old_rel"]) != norm_path(plan["new_rel"])]
     if not usable:
         return []
+    if all(len(_segs(plan["new_rel"])) > len(_segs(plan["old_rel"])) for plan in usable):
+        return _stage_extra_layers(usable)
     parsed = []
     parents_old: set[str] = set()
     parents_new: set[str] = set()
@@ -425,15 +733,26 @@ def remaining_ops(plans: list[dict], names: set[str] | list[str]) -> list[dict]:
 
 
 def _file_op_past(op: dict, plans: list[dict], have: set[str]) -> bool:
-    """True when qBit already has a later name for the plan this file op belongs to."""
+    """True when qBit already has a later hop for every plan this file op belongs to."""
     target = norm_path(op["new"])
-    for plan in plans:
-        if norm_path(plan["new_rel"]) not in have:
+    matched = _matching_plans(op, plans)
+    if not matched:
+        return False
+    saw = False
+    for plan in matched:
+        final = norm_path(plan["new_rel"])
+        hops = [norm_path(hop) for hop in plan_hops(plan["old_rel"], plan["new_rel"])]
+        if target not in hops:
+            if final in have and target != final:
+                saw = True
+                continue
+            return False
+        later = hops[hops.index(target) + 1 :]
+        if any(hop in have for hop in later):
+            saw = True
             continue
-        mid = intermediate_rel(plan["old_rel"], plan["new_rel"])
-        if mid and target == norm_path(mid):
-            return True
-    return False
+        return False
+    return saw
 
 
 class RenameFailed(RuntimeError):
@@ -450,12 +769,16 @@ def _disk_for(host_save: str, rel: str) -> str:
     return norm_path(host_save.rstrip("/") + "/" + rel.lstrip("/"))
 
 
+def _location_rels(old_rel: str, new_rel: str) -> list[str]:
+    rels = list(plan_hops(old_rel, new_rel))
+    wrapped = _wrapped_root_rel(old_rel)
+    if wrapped and norm_path(wrapped) not in {norm_path(item) for item in rels}:
+        rels.append(wrapped)
+    return rels
+
+
 def _candidate_disks(plan: dict, host_save: str) -> list[str]:
-    rels = [plan["old_rel"], plan["new_rel"]]
-    mid = intermediate_rel(plan["old_rel"], plan["new_rel"])
-    if mid:
-        rels.insert(1, mid)
-    paths = [_disk_for(host_save, rel) for rel in rels]
+    paths = [_disk_for(host_save, rel) for rel in _location_rels(plan["old_rel"], plan["new_rel"])]
     paths.append(plan["host_old"])
     paths.append(plan["host_new"])
     unique: list[str] = []
@@ -480,20 +803,23 @@ def restore_filmix(plans: list[dict], host_save: str) -> None:
 
 
 def _qbit_rel(plan: dict, names: set[str]) -> str:
-    if norm_path(plan["new_rel"]) in names:
-        return plan["new_rel"]
-    mid = intermediate_rel(plan["old_rel"], plan["new_rel"])
-    if mid and norm_path(mid) in names:
-        return mid
-    return plan["old_rel"]
+    for hop in reversed(plan_hops(plan.get("old_rel") or "", plan.get("new_rel") or "")):
+        if norm_path(hop) in names:
+            return hop
+    collapsed = _collapsed_rel(plan.get("new_rel") or "", names)
+    if collapsed:
+        return collapsed
+    reverted = _root_reverted_name(plan, names)
+    if reverted:
+        return reverted
+    return plan.get("old_rel") or ""
 
 
 def plan_has_bytes(plan: dict, host_save: str) -> bool:
-    """True when this torrent file has bytes at the old, mid, or Filmix path."""
-    paths = [plan.get("host_old") or "", plan.get("host_new") or ""]
-    mid = intermediate_rel(plan.get("old_rel") or "", plan.get("new_rel") or "")
-    if mid:
-        paths.append(_disk_for(host_save, mid))
+    """True when this torrent file has bytes at an old, hop, wrapped, or Filmix path."""
+    paths = [_disk_for(host_save, hop) for hop in _location_rels(plan.get("old_rel") or "", plan.get("new_rel") or "")]
+    paths.append(plan.get("host_old") or "")
+    paths.append(plan.get("host_new") or "")
     return any(path and os.path.lexists(path) for path in paths)
 
 
@@ -522,12 +848,13 @@ def align_disk_to_qbit(plans: list[dict], names: set[str], host_save: str) -> No
 
 
 def _file_disk_alts(op: dict, plans: list[dict], host_save: str) -> list[str]:
-    """Stage target, or the matching plan's Filmix final path for a mid/final rename."""
+    """Stage target, or the matching plan's Filmix final path for any earlier hop."""
     alts = [_disk_for(host_save, op["new"])]
+    op_old = norm_path(op["old"])
     op_new = norm_path(op["new"])
     for plan in plans:
-        mid = intermediate_rel(plan["old_rel"], plan["new_rel"])
-        if op_new != norm_path(plan["new_rel"]) and (not mid or op_new != norm_path(mid)):
+        hops = {norm_path(hop) for hop in plan_hops(plan["old_rel"], plan["new_rel"])}
+        if op_old not in hops and op_new not in hops:
             continue
         host_new = plan.get("host_new") or ""
         if host_new and host_new not in alts:
@@ -559,23 +886,19 @@ def _matching_plans(op: dict, plans: list[dict]) -> list[dict]:
     target = norm_path(op["new"])
     matched = []
     for plan in plans:
-        rels = {norm_path(plan["old_rel"]), norm_path(plan["new_rel"])}
-        mid = intermediate_rel(plan["old_rel"], plan["new_rel"])
-        if mid:
-            rels.add(norm_path(mid))
+        rels = {norm_path(hop) for hop in plan_hops(plan["old_rel"], plan["new_rel"])}
         if source in rels or target in rels:
             matched.append(plan)
     return matched
 
 
 def _final_covers_mid(op: dict, plans: list[dict]) -> bool:
-    """Filmix already left this file at host_new, so a mid stage must not pull it back."""
+    """Filmix already left this file at host_new, so an earlier hop must not pull it back."""
     if op.get("kind") != "file":
         return False
     target = norm_path(op["new"])
     for plan in plans:
-        mid = intermediate_rel(plan["old_rel"], plan["new_rel"])
-        if not mid or norm_path(mid) != target:
+        if target == norm_path(plan.get("new_rel") or ""):
             continue
         host_new = plan.get("host_new") or ""
         if host_new and os.path.lexists(host_new):
@@ -584,21 +907,28 @@ def _final_covers_mid(op: dict, plans: list[dict]) -> bool:
 
 
 def _file_sources(op: dict, plans: list[dict], host_save: str) -> list[str]:
-    """Candidate bytes for a file stage: old path, mid, host_old, then host_new if this is the final name."""
+    """Candidate bytes for a file stage: previous hop, other hops, then host_new on the final name."""
     target = norm_path(op["new"])
     primary = [_disk_for(host_save, op["old"])]
     mids: list[str] = []
     olds: list[str] = []
     finals: list[str] = []
     for plan in _matching_plans(op, plans):
-        mid = intermediate_rel(plan["old_rel"], plan["new_rel"])
-        if mid:
-            mids.append(_disk_for(host_save, mid))
+        final = norm_path(plan["new_rel"])
+        old_rel = norm_path(plan["old_rel"])
+        for hop in plan_hops(plan["old_rel"], plan["new_rel"]):
+            hop_norm = norm_path(hop)
+            if hop_norm in (old_rel, final):
+                continue
+            mids.append(_disk_for(host_save, hop))
         olds.append(_disk_for(host_save, plan["old_rel"]))
+        wrapped = _wrapped_root_rel(plan["old_rel"])
+        if wrapped:
+            olds.append(_disk_for(host_save, wrapped))
         if plan.get("host_old"):
             olds.append(plan["host_old"])
         host_new = plan.get("host_new") or ""
-        if host_new and target == norm_path(plan["new_rel"]) and (not mid or target != norm_path(mid)):
+        if host_new and target == final:
             finals.append(host_new)
     return _unique_paths(primary + mids + olds + finals)
 
@@ -607,15 +937,39 @@ def _plan_file_sources(plan: dict, host_save: str, current_rel: str) -> list[str
     sources = []
     if current_rel:
         sources.append(_disk_for(host_save, current_rel))
-    sources.append(_disk_for(host_save, plan["old_rel"]))
-    mid = intermediate_rel(plan["old_rel"], plan["new_rel"])
-    if mid:
-        sources.append(_disk_for(host_save, mid))
+    for hop in _location_rels(plan["old_rel"], plan["new_rel"]):
+        sources.append(_disk_for(host_save, hop))
     if plan.get("host_old"):
         sources.append(plan["host_old"])
     if plan.get("host_new"):
         sources.append(plan["host_new"])
     return _unique_paths(sources)
+
+
+def _plan_suppress_pairs(plan: dict, host_save: str) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    host_old = plan.get("host_old") or ""
+    host_new = plan.get("host_new") or ""
+    if host_old and host_new:
+        pairs.append((host_old, host_new))
+    disks: list[str] = []
+    for hop in plan_hops(plan.get("old_rel") or "", plan.get("new_rel") or ""):
+        disk = _disk_for(host_save, hop)
+        if disk and disk not in disks:
+            disks.append(disk)
+    wrapped = _wrapped_root_rel(plan.get("old_rel") or "")
+    if wrapped:
+        disk = _disk_for(host_save, wrapped)
+        if disk and disk not in disks:
+            disks.append(disk)
+    for disk in disks:
+        if host_old:
+            pairs.append((host_old, disk))
+        if host_new:
+            pairs.append((disk, host_new))
+    for left, right in zip(disks, disks[1:]):
+        pairs.append((left, right))
+    return pairs
 
 
 def _ensure_disk_at(host_save: str, src_candidates: list[str], dest_rel: str) -> bool:
@@ -736,6 +1090,49 @@ def _retry_blob(infohash: str, name: str, host_save: str, plans: list[dict]) -> 
     )
 
 
+def _repair_collapsed(client, infohash: str, plans: list[dict], host_save: str, fetch, say) -> None:
+    """Point a collapsed Season N/file qB path back at the full show path."""
+
+    def place(plan: dict, old: str, new: str) -> None:
+        op = {"kind": "file", "old": old, "new": new}
+        if _final_covers_mid(op, [plan]):
+            return
+        if not plan_has_bytes(plan, host_save) and not os.path.lexists(_disk_for(host_save, old)):
+            return
+        _ensure_disk_at(host_save, _plan_file_sources(plan, host_save, old), new)
+
+    def rename(plan: dict, old: str, new: str, label: str) -> None:
+        if norm_path(old).lstrip("/") == norm_path(new).lstrip("/"):
+            return
+        say(f"{label} {old} → {new}")
+        place(plan, old, new)
+        client.rename_file(infohash, old, new)
+
+    for plan in plans:
+        full = norm_path(plan["new_rel"])
+        names = _names_of(fetch())
+        if full in names or norm_path(full).lstrip("/") in names:
+            continue
+        collapsed = _collapsed_rel(full, names)
+        if not collapsed:
+            reverted = _root_reverted_name(plan, names)
+            if reverted:
+                rename(plan, reverted, plan["new_rel"], "根目錄檔對回")
+            continue
+        rename(plan, collapsed, plan["new_rel"], "季資料夾路徑對回")
+        names = _names_of(fetch())
+        if full in names:
+            continue
+        current = _collapsed_rel(full, names) or collapsed
+        for old, new in _uncollapse_ops(current, plan["new_rel"]):
+            names = _names_of(fetch())
+            if full in names:
+                break
+            if norm_path(old) not in names:
+                continue
+            rename(plan, old, new, "季資料夾路徑對回")
+
+
 def execute_plans(
     client,
     infohash: str,
@@ -786,6 +1183,7 @@ def execute_plans(
     try:
         _client_quiet(client, "stop", infohash)
         align_disk_to_qbit(plans, names, host_save)
+        _repair_collapsed(client, infohash, plans, host_save, fetch, say)
         ops = remaining_ops(plans, _names_of(fetch()))
         if not ops:
             _start()
@@ -831,6 +1229,7 @@ def execute_plans(
             if any(plan_has_bytes(plan, host_save) for plan in _matching_plans(op, plans)):
                 raise RenameFailed(f"qBittorrent 未完成改名（{label}）：{op['new']}")
             say(f"未下載：qB 路徑未跟上 {op['new']}")
+        _repair_collapsed(client, infohash, plans, host_save, fetch, say)
     except Exception as exc:
         try:
             downloaded = _byte_plans(plans, host_save)
@@ -1028,7 +1427,7 @@ class Engine:
                 if not rel:
                     continue
                 host_file = norm_path(host_save + "/" + rel)
-                new_host = choose_new_host(host_file, batch)
+                new_host = choose_content_host(host_file, batch, root=_root_rel(rel))
                 if new_host is None:
                     db.add_activity(
                         "error",
@@ -1193,12 +1592,8 @@ class Engine:
         if olds & news:
             raise RenameFailed("這次改名互相對調，已停止以免覆蓋檔案", blob)
         for plan in plans:
-            self._suppress(plan["host_old"], plan["host_new"])
-            mid = intermediate_rel(plan["old_rel"], plan["new_rel"])
-            if mid:
-                middle = _disk_for(host_save, mid)
-                self._suppress(plan["host_old"], middle)
-                self._suppress(middle, plan["host_new"])
+            for src, dst in _plan_suppress_pairs(plan, host_save):
+                self._suppress(src, dst)
         try:
             client.stop(infohash)
         except Exception as exc:  # noqa: BLE001
@@ -1254,7 +1649,8 @@ class Engine:
             infohash = payload["infohash"]
             name = payload.get("name") or infohash[:8]
             for plan in plans:
-                self._suppress(plan["host_old"], plan["host_new"])
+                for src, dst in _plan_suppress_pairs(plan, host_save):
+                    self._suppress(src, dst)
             client = Qbit(db.get_settings())
             client.login()
             tor = client.torrent(infohash)
@@ -1361,6 +1757,24 @@ def self_test() -> None:
     }
     assert remaining_ops(movie, {"Old Title/New.iso"}) == [ops[1]]
     assert remaining_ops(movie, {"New Title (2026) [tmdbid=1]/New.iso"}) == []
+    fallout_old = "Fallout/Fallout.S02E01-1080p-Amazon.WEB-DL-AVC-DDP 5.1.mkv"
+    fallout_season = (
+        "辐射 (2024) [tmdbid=106379]/Season 2/"
+        "辐射 (2024) S02E01-1080p-Amazon.WEB-DL-AVC-DDP 5.1-[tmdbid=106379].mkv"
+    )
+    season_ops = stage_ops([{"old_rel": fallout_old, "new_rel": fallout_season}])
+    assert season_ops[-1]["new"] == fallout_season
+    for item in season_ops:
+        old_segs, new_segs = _segs(item["old"]), _segs(item["new"])
+        assert not (len(new_segs) > len(old_segs) and old_segs[:1] != new_segs[:1])
+    assert _collapsed_rel(fallout_season, {"Season 2/" + fallout_season.split("/")[-1]}) == (
+        "Season 2/" + fallout_season.split("/")[-1]
+    )
+    root_new = "abc [tmdbid=123]/abc [tmdbid=123].iso"
+    root_ops = stage_ops([{"old_rel": "/abc.iso", "new_rel": root_new}])
+    assert root_ops == [{"kind": "file", "old": "abc.iso", "new": root_new}], root_ops
+    assert _wrapped_root_rel("abc.iso") == "abc/abc.iso"
+    assert _wrapped_root_rel("abc/abc.iso") is None
     print("self-test ok")
 
 
